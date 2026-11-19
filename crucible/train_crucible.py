@@ -85,8 +85,8 @@ def train_one(name, model, train_loader, val_loader, device, epochs=25, lr=2e-3,
         model.train()
         loss_sum = 0.0
         act_sum = 0.0
-        # Union Warmup schedule: 1.0 -> 0.0 cleanly over first 60% of epochs
-        union_prob = max(0.0, 1.0 - (ep - 1) / max(1, int(0.6 * epochs)))
+        # Union Warmup schedule: 1.0 -> 0.0 cleanly over first 35% of epochs
+        union_prob = max(0.0, 1.0 - (ep - 1) / max(1, int(0.35 * epochs)))
 
         for batch in train_loader:
             img = batch["image"].to(device)
@@ -110,7 +110,7 @@ def train_one(name, model, train_loader, val_loader, device, epochs=25, lr=2e-3,
                         for sl, st in zip(out["split_logits"], out["split_targets"])
                     ) / len(out["split_logits"])
 
-                    loss = seg_loss + 1.0 * split_loss
+                    loss = seg_loss + 1.0 * split_loss + 0.05 * out["fp_loss"]
                     act_sum += out["active_ratio"] * 100.0
                 else:
                     out = model(img)
@@ -159,8 +159,8 @@ def main():
         torch.cuda.empty_cache()
 
     haizk = train_one(
-        "HaizkLow (D=16, K=3)",
-        HaizkLow(d_fiber=16, hidden=48, n_vcycles=3, smooth_steps=1, use_checkpoint=True),
+        "HaizkLow v2 (C=32, K=3)",
+        HaizkLow(ch=32, groups=4, n_vcycles=3, smooth_steps=1, use_checkpoint=False),
         train_loader, val256_loader, device, epochs=25, lr=3e-3, is_haizklow=True
     )
 
