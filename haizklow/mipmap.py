@@ -51,7 +51,9 @@ class MultiStatSE2Pyramid(nn.Module):
     @torch.no_grad()
     def forward(self, img):
         B, C, H, W = img.shape
-        assert H == W and H >= self.root_res and (H & (H - 1)) == 0, "H=W must be power of 2 >= 32"
+        ratio = H // self.root_res
+        assert H == W and H % self.root_res == 0 and ratio >= 1 and (ratio & (ratio - 1)) == 0, \
+            f"H=W={H} must be root_res({self.root_res}) * 2^k"
 
         lum = (img * self.luma_w).sum(dim=1, keepdim=True)
         pos_r, neg_r = self._multiscale_ridge(lum)

@@ -89,43 +89,37 @@ def gather_brick_halo_flat(x: torch.Tensor, nb_idx: torch.Tensor) -> torch.Tenso
 
 class ContractiveBrickSmoother(nn.Module):
     """
-    Hardware-native 4x4 Brick PDE Smoother:
-      1. groups=4 3x3 spatial conv on 6x6 halo -> 4 isolated 8-ch highway banks + full 3x3 curve/crossing vision
-      2. Bottleneck 1x1 ConvGRU relaxation: u_next = (1 - g)*u + g*tanh(cand), g in (0, 0.5)
-         -> Strictly bounded inside [-1, 1] for ANY number of V-cycles K!
+    Full-gradient Pre-Norm Residual + Post-State GroupNorm 4x4 Brick Smoother.
+      - Kaiming-init spatial & pointwise layers -> full gradient flow from Batch 1!
+      - state_norm -> strictly unit-variance state so K=6 NEVER explodes!
     """
     def __init__(self, ch: int = 32, groups: int = 4):
         super().__init__()
         self.ch = ch
         self.spatial_conv = nn.Conv2d(ch, ch, kernel_size=3, padding=0, groups=groups)
 
-        in_dim = 3 * ch + 2  # [u, spatial, f_emb, rel_depth, is_finest]
+        in_dim = 3 * ch + 2
         self.norm = nn.GroupNorm(1, in_dim)
         self.pw = nn.Sequential(
-            nn.Conv2d(in_dim, ch, kernel_size=1),
+            nn.Conv2d(in_dim, ch * 2, kernel_size=1),
             nn.GELU(),
-            nn.Conv2d(ch, 2 * ch, kernel_size=1),
+            nn.Conv2d(ch * 2, ch, kernel_size=1),
         )
-        # Calm initial relaxation gate g = 0.5 * sigmoid(-1.0) ~= 0.13
-        nn.init.zeros_(self.pw[-1].weight)
-        nn.init.zeros_(self.pw[-1].bias)
-        with torch.no_grad():
-            self.pw[-1].bias[ch:].fill_(-1.0)
+        self.res_scale = nn.Parameter(torch.tensor(0.5))
+        self.state_norm = nn.GroupNorm(1, ch)
 
     def _step_from_padded(self, u: torch.Tensor, u_pad: torch.Tensor, f_emb: torch.Tensor,
                           rel_depth: float, is_finest: float) -> torch.Tensor:
         N, C, Hp, Wp = u.shape
-        spatial = self.spatial_conv(u_pad)  # [N, C, Hp, Wp]
+        spatial = self.spatial_conv(u_pad)
 
         scale_feat = torch.empty(N, 2, Hp, Wp, device=u.device, dtype=u.dtype)
         scale_feat[:, 0] = rel_depth
         scale_feat[:, 1] = is_finest
 
         x = torch.cat([u, spatial, f_emb, scale_feat], dim=1)
-        out = self.pw(self.norm(x)).to(u.dtype)
-        cand, gate_logit = out.chunk(2, dim=1)
-        g = 0.5 * torch.sigmoid(gate_logit)
-        return (1.0 - g) * u + g * torch.tanh(cand)
+        du = self.pw(self.norm(x)).to(u.dtype)
+        return self.state_norm(u + self.res_scale.to(u.dtype) * du).to(u.dtype)
 
     def smooth_bricks(self, u: torch.Tensor, lvl: QuadtreeLevel,
                       rel_depth: float, is_finest: float, steps: int = 1) -> torch.Tensor:
@@ -143,11 +137,12 @@ class ContractiveBrickSmoother(nn.Module):
 
 
 class HaizkLow(nn.Module):
-    def __init__(self, ch: int = 32, groups: int = 4, n_vcycles: int = 3,
+    def __init__(self, ch: int = 32, groups: int = 4, out_ch: int = 2, n_vcycles: int = 3,
                  smooth_steps: int = 1, tile_size: int = 4, root_bricks: int = 8,
                  use_checkpoint: bool = False):
         super().__init__()
         self.ch = ch
+        self.out_ch = out_ch
         self.n_vcycles = n_vcycles
         self.smooth_steps = smooth_steps
         self.tile_size = tile_size
@@ -174,17 +169,18 @@ class HaizkLow(nn.Module):
         )
         nn.init.constant_(self.split_head[-1].bias, -1.0)
 
-        self.out_head = nn.Conv2d(ch, 2, kernel_size=1)
+        self.out_head = nn.Conv2d(ch, out_ch, kernel_size=1)
 
         G0 = root_bricks
         codes = [_morton2d(r % G0, r // G0) for r in range(G0 * G0)]
         morton_perm = torch.tensor(sorted(range(G0 * G0), key=lambda r: codes[r]), dtype=torch.long)
         inv_perm = torch.argsort(morton_perm)
+        sorted_codes = torch.tensor([codes[r] for r in morton_perm.tolist()], dtype=torch.long)
         self.register_buffer("l0_morton_perm", morton_perm)
         self.register_buffer("l0_inv_perm", inv_perm)
         self.register_buffer("l0_by", morton_perm // G0)
         self.register_buffer("l0_bx", morton_perm % G0)
-        self.register_buffer("l0_codes", torch.arange(G0 * G0, dtype=torch.long))
+        self.register_buffer("l0_codes", sorted_codes)
 
     def _gather_bricks(self, dense: torch.Tensor, b_idx, by_idx, bx_idx) -> torch.Tensor:
         B, C, H, W = dense.shape
@@ -249,10 +245,10 @@ class HaizkLow(nn.Module):
         u8 = self.smoother.smooth_dense(u8_0, f8, rel_depth=-0.5, is_finest=0.0, steps=4)
 
         # Bounded FAS prolongation -> cannot drift or blow up!
-        u16 = u16 + torch.tanh(self._prolong_op(u8 - u8_0)).to(u16.dtype)
+        u16 = self.smoother.state_norm(u16 + self._prolong_op(u8 - u8_0).to(u16.dtype)).to(u16.dtype)
         u16 = self.smoother.smooth_dense(u16, f16, rel_depth=-0.25, is_finest=0.0, steps=2)
 
-        u32 = u32 + torch.tanh(self._prolong_op(u16 - u16_0)).to(u32.dtype)
+        u32 = self.smoother.state_norm(u32 + self._prolong_op(u16 - u16_0).to(u32.dtype)).to(u32.dtype)
         u32 = self.smoother.smooth_dense(u32, f32_emb, rel_depth=0.0, is_finest=0.0, steps=2)
 
         return self._dense_to_l0_bricks(u32)
@@ -279,7 +275,7 @@ class HaizkLow(nn.Module):
             s_steps = self.smooth_steps if is_f > 0.5 else max(2, self.smooth_steps)
             coarse_delta = states[l - 1] - saved_parents[l - 1]
             delta_fine = self._prolongate_to_children(coarse_delta, levels[l].parent_sel)
-            states[l] = states[l] + torch.tanh(delta_fine).to(states[l].dtype)
+            states[l] = self.smoother.state_norm(states[l] + delta_fine.to(states[l].dtype)).to(states[l].dtype)
             states[l] = self.smoother.smooth_bricks(states[l], levels[l], rel_d, is_f, steps=s_steps)
 
         return states
@@ -288,23 +284,24 @@ class HaizkLow(nn.Module):
                                 B: int, H: int, W: int) -> torch.Tensor:
         device = states[0].device
         T = self.tile_size
-        out = torch.zeros(B, 2, H, W, device=device, dtype=torch.float32)
+        C_out = self.out_ch
+        out = torch.zeros(B, C_out, H, W, device=device, dtype=torch.float32)
         covered = torch.zeros(B, 1, H, W, device=device, dtype=torch.float32)
 
         for l in range(len(levels) - 1, -1, -1):
             lvl = levels[l]
-            brick_logits = self.out_head(states[l]).float()  # [N, 2, T, T]
+            brick_logits = self.out_head(states[l]).float()  # [N, C_out, T, T]
             N = brick_logits.shape[0]
             G = lvl.grid_size
 
-            grid = torch.zeros(B, G, G, 2, T, T, device=device, dtype=torch.float32)
+            grid = torch.zeros(B, G, G, C_out, T, T, device=device, dtype=torch.float32)
             mask = torch.zeros(B, G, G, 1, T, T, device=device, dtype=torch.float32)
             ones = torch.ones(N, 1, T, T, device=device, dtype=torch.float32)
 
             grid = grid.index_put((lvl.b_idx, lvl.by_idx, lvl.bx_idx), brick_logits)
             mask = mask.index_put((lvl.b_idx, lvl.by_idx, lvl.bx_idx), ones)
 
-            lvl_logits = grid.permute(0, 3, 1, 4, 2, 5).reshape(B, 2, G * T, G * T)
+            lvl_logits = grid.permute(0, 3, 1, 4, 2, 5).reshape(B, C_out, G * T, G * T)
             lvl_mask = mask.permute(0, 3, 1, 4, 2, 5).reshape(B, 1, G * T, G * T)
 
             if G * T != H:
@@ -341,7 +338,7 @@ class HaizkLow(nn.Module):
 
         f0_raw = self._gather_bricks(pyr[0], b0, by0, bx0)
         f0_emb = self._gather_bricks(f32_emb, b0, by0, bx0)
-        u0 = torch.tanh(f0_emb)
+        u0 = self.smoother.state_norm(f0_emb).to(f0_emb.dtype)
         lvl0 = QuadtreeLevel(G0, b0, by0, bx0, m0, bmap0, nb0, None, f0_raw, f0_emb, u0)
         lvl0.state = self.smoother.smooth_bricks(u0, lvl0, rel_depth=0.0, is_finest=0.0, steps=1)
 
@@ -395,7 +392,7 @@ class HaizkLow(nn.Module):
 
             f_raw_next = self._gather_bricks(pyr[l + 1], c_b, c_by, c_bx)
             f_emb_next = self.init_proj(f_raw_next)
-            u_next = torch.tanh(0.5 * f_emb_next + 0.5 * self._prolongate_to_children(cur.state, p_sel).to(f_emb_next.dtype))
+            u_next = self.smoother.state_norm(0.5 * f_emb_next + 0.5 * self._prolongate_to_children(cur.state, p_sel).to(f_emb_next.dtype)).to(f_emb_next.dtype)
 
             lvl_next = QuadtreeLevel(G_next, c_b, c_by, c_bx, c_morton, bmap_next, nb_next, p_sel, f_raw_next, f_emb_next, u_next)
             rel_d = (l + 1) / max(n_lvls - 1, 1)
@@ -409,7 +406,8 @@ class HaizkLow(nn.Module):
         fp_loss = torch.zeros((), device=device, dtype=torch.float32)
         cycles_used = 0
 
-        for k in range(self.n_vcycles):
+        n_run = int(torch.randint(2, self.n_vcycles + 2, (1,)).item()) if self.training else self.n_vcycles
+        for k in range(n_run):
             prev_finest = states[-1]
             if self.use_checkpoint and self.training:
                 states = list(checkpoint(
@@ -420,10 +418,10 @@ class HaizkLow(nn.Module):
                 states = self._run_vcycle(states, levels, f32_emb, sub_emb)
 
             cycles_used = k + 1
-            if k == self.n_vcycles - 1:
+            if k == n_run - 1:
                 fp_loss = (states[-1] - prev_finest).float().pow(2).mean()
 
-            if self.training or k == self.n_vcycles - 1 or adaptive_exit_eps is not None:
+            if self.training or k == n_run - 1 or adaptive_exit_eps is not None:
                 cycle_logits.append(self._decode_quadtree_logits(states, levels, B, H, W))
 
             if (not self.training) and adaptive_exit_eps is not None and k >= 1:

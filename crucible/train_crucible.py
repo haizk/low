@@ -36,7 +36,14 @@ def benchmark_model(model, loader, device, is_haizklow=False, n_vcycles_eval=Non
     if is_haizklow and n_vcycles_eval is not None:
         model.n_vcycles = n_vcycles_eval
 
-    totals = {"av_dice": 0.0, "av_sep": 0.0, "crossing_f1": 0.0, "thin_recall": 0.0, "active_pct": 0.0}
+    totals = {
+        "av_dice": 0.0,
+        "av_sep": 0.0,
+        "crossing_f1": 0.0,
+        "thin_f1": 0.0,
+        "vessel_dice": 0.0,
+        "active_pct": 0.0,
+    }
     n_batches = 0
     t_ms = 0.0
 
@@ -55,8 +62,21 @@ def benchmark_model(model, loader, device, is_haizklow=False, n_vcycles_eval=Non
             torch.cuda.synchronize()
         t_ms += (time.perf_counter() - t0) * 1000.0 / img.shape[0]
 
+        # Pure Blood Vessel Segmentation Dice (Union: Artery | Vein)
+        prob = torch.sigmoid(out["logits"])
+        pred_v = (prob.max(dim=1).values > 0.5).float()
+        tgt_v = (tgt.max(dim=1).values > 0.5).float()
+        v_inter = (pred_v * tgt_v).sum()
+        totals["vessel_dice"] += ((2.0 * v_inter + 1e-6) / (pred_v.sum() + tgt_v.sum() + 1e-6)).item()
+
+        # Honest Thin1px F1 (on vessels inside thin_zone, not inflated Recall!)
+        tz2 = tz.unsqueeze(1).expand_as(tgt)
+        pred_av = (prob > 0.5).float()
+        t_inter = (pred_av[tz2] * tgt[tz2]).sum()
+        totals["thin_f1"] += ((2.0 * t_inter + 1e-6) / (pred_av[tz2].sum() + tgt[tz2].sum() + 1e-6)).item()
+
         m = evaluate_crucible(out["logits"], tgt, cz, tz)
-        for k in ("av_dice", "crossing_f1", "thin_recall"):
+        for k in ("av_dice", "crossing_f1"):
             totals[k] += m[k]
         totals["active_pct"] += out.get("active_ratio", 1.0) * 100.0
 
@@ -110,7 +130,7 @@ def train_one(name, model, train_loader, val_loader, device, epochs=25, lr=2e-3,
                         for sl, st in zip(out["split_logits"], out["split_targets"])
                     ) / len(out["split_logits"])
 
-                    loss = seg_loss + 1.0 * split_loss + 0.05 * out["fp_loss"]
+                    loss = seg_loss + 1.0 * split_loss
                     act_sum += out["active_ratio"] * 100.0
                 else:
                     out = model(img)
@@ -129,9 +149,9 @@ def train_one(name, model, train_loader, val_loader, device, epochs=25, lr=2e-3,
             val = benchmark_model(model, val_loader, device, is_haizklow=is_haizklow)
             print(
                 f"Ep {ep:02d}/{epochs} | loss={loss_sum/len(train_loader):.4f} | "
-                f"AV_Dice={val['av_dice']:.4f} | AV_Sep={val['av_sep']:.4f} | Cross_F1={val['crossing_f1']:.4f} | "
-                f"Thin1px={val['thin_recall']:.4f} | Active={val['active_pct']:.1f}% | "
-                f"{val['ms_per_img']:.1f} ms/img"
+                f"Vessel={val['vessel_dice']:.4f} | AV_Dice={val['av_dice']:.4f} | AV_Sep={val['av_sep']:.4f} | "
+                f"Cross_F1={val['crossing_f1']:.4f} | Thin_F1={val['thin_f1']:.4f} | "
+                f"Active={val['active_pct']:.1f}% | {val['ms_per_img']:.1f} ms/img"
             )
     return model
 
@@ -171,9 +191,26 @@ def main():
         r_hl3 = benchmark_model(haizk, loader, device, is_haizklow=True, n_vcycles_eval=3)
         r_hl6 = benchmark_model(haizk, loader, device, is_haizklow=True, n_vcycles_eval=6)
         print(f"\n--- {tag} ---")
-        print(f"  Half-UNet     : AV_Dice={r_hu['av_dice']:.4f} | AV_Sep={r_hu['av_sep']:.4f} | Cross_F1={r_hu['crossing_f1']:.4f} | Thin1px={r_hu['thin_recall']:.4f} | Active=100.0% | {r_hu['ms_per_img']:.1f} ms")
-        print(f"  HaizkLow (K=3): AV_Dice={r_hl3['av_dice']:.4f} | AV_Sep={r_hl3['av_sep']:.4f} | Cross_F1={r_hl3['crossing_f1']:.4f} | Thin1px={r_hl3['thin_recall']:.4f} | Active={r_hl3['active_pct']:.1f}% | {r_hl3['ms_per_img']:.1f} ms")
-        print(f"  HaizkLow (K=6): AV_Dice={r_hl6['av_dice']:.4f} | AV_Sep={r_hl6['av_sep']:.4f} | Cross_F1={r_hl6['crossing_f1']:.4f} | Thin1px={r_hl6['thin_recall']:.4f} | Active={r_hl6['active_pct']:.1f}% | {r_hl6['ms_per_img']:.1f} ms")
+        print(f"  Half-UNet     : Vessel={r_hu['vessel_dice']:.4f} | AV_Dice={r_hu['av_dice']:.4f} | AV_Sep={r_hu['av_sep']:.4f} | Cross_F1={r_hu['crossing_f1']:.4f} | Thin_F1={r_hu['thin_f1']:.4f} | Active=100.0% | {r_hu['ms_per_img']:.1f} ms")
+        print(f"  HaizkLow (K=3): Vessel={r_hl3['vessel_dice']:.4f} | AV_Dice={r_hl3['av_dice']:.4f} | AV_Sep={r_hl3['av_sep']:.4f} | Cross_F1={r_hl3['crossing_f1']:.4f} | Thin_F1={r_hl3['thin_f1']:.4f} | Active={r_hl3['active_pct']:.1f}% | {r_hl3['ms_per_img']:.1f} ms")
+        print(f"  HaizkLow (K=6): Vessel={r_hl6['vessel_dice']:.4f} | AV_Dice={r_hl6['av_dice']:.4f} | AV_Sep={r_hl6['av_sep']:.4f} | Cross_F1={r_hl6['crossing_f1']:.4f} | Thin_F1={r_hl6['thin_f1']:.4f} | Active={r_hl6['active_pct']:.1f}% | {r_hl6['ms_per_img']:.1f} ms")
+
+    # Quick C-style bottleneck profiler on one 512x512 batch
+    sample_img = next(iter(val512_res_loader))["image"].to(device)
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16, enabled=(device.type == "cuda")):
+        haizk.eval()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        pyr, sub = haizk.pyramid(sample_img)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        _ = haizk(sample_img)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        print(f"\n[Profile 512x512 B={sample_img.shape[0]}] Pyramid={(t1-t0)*1e3/sample_img.shape[0]:.1f} ms/img | Total={(t2-t1)*1e3/sample_img.shape[0]:.1f} ms/img")
 
 
 if __name__ == "__main__":
