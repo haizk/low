@@ -1,8 +1,8 @@
 # haizklow/se2_multigrid.py
-# HaizkLow — Standalone Adaptive Morton-Quadtree + SE(2) Fiber Multigrid Engine (Phase 1)
+# HaizkLow — Standalone Adaptive Morton-Quadtree + SE(2) Fiber Multigrid Engine (Phase 1 Fast)
 #
-# Zero U-Net. Zero Self-Attention. Zero Mamba.
-# Pure weight-tied SE(2) Anisotropic PDE Smoother + Morton 4x4 Brick Multigrid V-Cycles.
+# Zero U-Net. Zero Self-Attention. Zero Mamba. Zero permute() HBM copies.
+# Conservative symmetric SE(2) conductance g_ij = p_i * p_j + Precomputed Morton neighbor table.
 
 from dataclasses import dataclass
 from typing import List, Optional
@@ -28,12 +28,8 @@ def _morton2d(x: int, y: int) -> int:
 
 
 def batch_gt_split_masks(target: torch.Tensor, tile_size: int = 4, root_bricks: int = 8) -> List[torch.Tensor]:
-    """
-    GPU-vectorized GT brick occupancy masks from [B, 2, H, W].
-    Returns [L0 (B,8,8), L1 (B,16,16), ..., L_finest (B,H//4,W//4)] float {0,1}.
-    """
-    fg = (target.sum(dim=1, keepdim=True) > 0.5).float()  # [B, 1, H, W]
-    cur = F.max_pool2d(fg, tile_size, tile_size)          # [B, 1, H//4, W//4]
+    fg = (target.sum(dim=1, keepdim=True) > 0.5).float()
+    cur = F.max_pool2d(fg, tile_size, tile_size)
     rev = [cur.squeeze(1)]
     while cur.shape[-1] > root_bricks:
         cur = F.max_pool2d(cur, 2, 2)
@@ -43,165 +39,151 @@ def batch_gt_split_masks(target: torch.Tensor, tile_size: int = 4, root_bricks: 
 
 @dataclass
 class QuadtreeLevel:
-    grid_size: int                  # G_l (number of 4x4 bricks per side)
-    b_idx: torch.Tensor             # [N] int64 batch index
-    by_idx: torch.Tensor            # [N] int64 brick y
-    bx_idx: torch.Tensor            # [N] int64 brick x
-    morton: torch.Tensor            # [N] int64 sorted Morton code per batch item
-    brick_map: torch.Tensor         # [B, G_l, G_l] int64 -> compact idx 0..N-1 or -1
-    parent_sel: Optional[torch.Tensor]  # [M] parent indices at l-1 that spawned this level (N = 4*M)
-    forcing: torch.Tensor           # [N, 4, 12, 4, 4] pre-gathered SE(2) mipmap forcing
-    state: torch.Tensor             # [N, 4, D, 4, 4] live SE(2) fiber state
+    grid_size: int
+    b_idx: torch.Tensor
+    by_idx: torch.Tensor
+    bx_idx: torch.Tensor
+    morton: torch.Tensor
+    brick_map: torch.Tensor
+    nb_idx: torch.Tensor                # [8, N] precomputed neighbor brick indices (N = sentinel zero)
+    parent_sel: Optional[torch.Tensor]
+    forcing: torch.Tensor               # [N, 4, 12, 4, 4]
+    state: torch.Tensor                 # [N, 4, D, 4, 4]
 
 
-def gather_brick_halo(u: torch.Tensor, lvl: QuadtreeLevel) -> torch.Tensor:
-    """
-    Exact 1-pixel sparse halo gather for active 4x4 bricks -> [N, 4, D, 6, 6].
-    Matches dense zero-padding bit-for-bit (Phase 2 replaces this with fused CUDA shared-mem!).
-    """
-    N, K, D, T, _ = u.shape
-    G = lvl.grid_size
-    device = u.device
-
-    # Sentinel zero brick at index N so inactive/OOB neighbors read 0 cleanly without branches
-    u_z = torch.cat([u, torch.zeros(1, K, D, T, T, device=device, dtype=u.dtype)], dim=0)
-    padded = torch.zeros(N, K, D, T + 2, T + 2, device=device, dtype=u.dtype)
-    padded[:, :, :, 1:T + 1, 1:T + 1] = u
-
-    b_idx, by_idx, bx_idx = lvl.b_idx, lvl.by_idx, lvl.bx_idx
-    bmap = lvl.brick_map
-
-    def nb(dy: int, dx: int) -> torch.Tensor:
+@torch.no_grad()
+def precompute_neighbor_table(b_idx: torch.Tensor, by_idx: torch.Tensor,
+                              bx_idx: torch.Tensor, bmap: torch.Tensor, G: int) -> torch.Tensor:
+    """Computed ONCE per Quadtree level (eliminates ~2,000 redundant kernel launches!)."""
+    N = b_idx.numel()
+    offsets = ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1))
+    nb_list = []
+    neg1 = torch.full_like(b_idx, -1)
+    sent = torch.full_like(b_idx, N)
+    for dy, dx in offsets:
         ny = by_idx + dy
         nx = bx_idx + dx
         valid = (ny >= 0) & (ny < G) & (nx >= 0) & (nx < G)
-        idx = torch.where(
-            valid,
-            bmap[b_idx, ny.clamp(0, G - 1), nx.clamp(0, G - 1)],
-            torch.full_like(b_idx, -1),
-        )
-        return torch.where(idx >= 0, idx, torch.full_like(idx, N))
+        idx = torch.where(valid, bmap[b_idx, ny.clamp(0, G - 1), nx.clamp(0, G - 1)], neg1)
+        nb_list.append(torch.where(idx >= 0, idx, sent))
+    return torch.stack(nb_list, dim=0)  # [8, N]
 
-    # 4 edges + 4 corners
-    padded[:, :, :, 0, 1:T + 1] = u_z[nb(-1, 0), :, :, T - 1, :]
-    padded[:, :, :, T + 1, 1:T + 1] = u_z[nb(1, 0), :, :, 0, :]
-    padded[:, :, :, 1:T + 1, 0] = u_z[nb(0, -1), :, :, :, T - 1]
-    padded[:, :, :, 1:T + 1, T + 1] = u_z[nb(0, 1), :, :, :, 0]
-    padded[:, :, :, 0, 0] = u_z[nb(-1, -1), :, :, T - 1, T - 1]
-    padded[:, :, :, 0, T + 1] = u_z[nb(-1, 1), :, :, T - 1, 0]
-    padded[:, :, :, T + 1, 0] = u_z[nb(1, -1), :, :, 0, T - 1]
-    padded[:, :, :, T + 1, T + 1] = u_z[nb(1, 1), :, :, 0, 0]
-    return padded
+
+def gather_brick_halo_fast(x: torch.Tensor, nb_idx: torch.Tensor) -> torch.Tensor:
+    """Fast 1px halo gather using precomputed nb_idx[8, N] -> [N, 4, C, T+2, T+2]."""
+    N, K, C, T, _ = x.shape
+    x_z = torch.cat([x, torch.zeros(1, K, C, T, T, device=x.device, dtype=x.dtype)], dim=0)
+    pad = torch.zeros(N, K, C, T + 2, T + 2, device=x.device, dtype=x.dtype)
+    pad[:, :, :, 1:T + 1, 1:T + 1] = x
+    pad[:, :, :, 0, 1:T + 1] = x_z[nb_idx[0], :, :, T - 1, :]
+    pad[:, :, :, T + 1, 1:T + 1] = x_z[nb_idx[1], :, :, 0, :]
+    pad[:, :, :, 1:T + 1, 0] = x_z[nb_idx[2], :, :, :, T - 1]
+    pad[:, :, :, 1:T + 1, T + 1] = x_z[nb_idx[3], :, :, :, 0]
+    pad[:, :, :, 0, 0] = x_z[nb_idx[4], :, :, T - 1, T - 1]
+    pad[:, :, :, 0, T + 1] = x_z[nb_idx[5], :, :, T - 1, 0]
+    pad[:, :, :, T + 1, 0] = x_z[nb_idx[6], :, :, 0, T - 1]
+    pad[:, :, :, T + 1, T + 1] = x_z[nb_idx[7], :, :, 0, 0]
+    return pad
 
 
 class SE2AnisotropicSmoother(nn.Module):
     """
-    C4 weight-shared SE(2) Orientation-Lifted PDE Smoother.
-    Fibers k=0(0°), 1(45°), 2(90°), 3(135°):
-      - Transport strictly along +/- d_k (ZERO direct 0° <-> 90° mixing!)
-      - Curvature coupling only between adjacent angles k +/- 1 (+/- 45°)
-      - Image forcing I_k pinned at every step so fine capillaries never blur out.
+    Zero-copy NCHW C4-shared SE(2) Conservative Anisotropic PDE Smoother.
+    Computes permeability (p_i, a_i) ONCE per pixel -> g_ij = p_i * p_j (symmetric conservative flux).
     """
     def __init__(self, d_fiber: int = 16, f_ch: int = 12, hidden: int = 48):
         super().__init__()
         self.d_fiber = d_fiber
 
-        # Directional edge conductance gate g_theta([u, u_nb - u, I_k]) -> (0, 1)^D
-        self.cond_gate = nn.Sequential(
-            nn.Linear(2 * d_fiber + f_ch, d_fiber * 2),
-            nn.GELU(),
-            nn.Linear(d_fiber * 2, d_fiber),
-        )
-        # Angular turning gate g_ang([u, u_adj - u, I_k]) -> (0, 1)^D
-        self.ang_gate = nn.Linear(2 * d_fiber + f_ch, d_fiber)
+        # Single 1x1 conv computes BOTH spatial permeability p and angular permeability a
+        self.gate_conv = nn.Conv2d(d_fiber + f_ch, 2 * d_fiber, kernel_size=1)
 
-        # Nonlinear local reaction MLP Phi_theta (resolution-agnostic via [rel_depth, is_finest])
+        # Zero-copy NCHW reaction MLP (GroupNorm(1, C) == LayerNorm across channels!)
         in_dim = 4 * d_fiber + f_ch + 2
-        self.norm = nn.LayerNorm(in_dim)
+        self.norm = nn.GroupNorm(1, in_dim)
         self.react = nn.Sequential(
-            nn.Linear(in_dim, hidden),
+            nn.Conv2d(in_dim, hidden, kernel_size=1),
             nn.GELU(),
-            nn.Linear(hidden, d_fiber),
+            nn.Conv2d(hidden, d_fiber, kernel_size=1),
         )
-        # Initialize reaction output small + damped step size dt in (0, 0.5)
         nn.init.zeros_(self.react[-1].weight)
         nn.init.zeros_(self.react[-1].bias)
-        self.dt_logit = nn.Parameter(torch.tensor(0.0))  # dt = 0.5 * sigmoid(0) = 0.25
+        self.dt_logit = nn.Parameter(torch.tensor(0.0))
 
-    def _step_from_padded(self, u: torch.Tensor, u_pad: torch.Tensor,
-                          forcing: torch.Tensor, rel_depth: float, is_finest: float) -> torch.Tensor:
-        """
-        u:       [N, 4, D, Hp, Wp]
-        u_pad:   [N, 4, D, Hp+2, Wp+2]
-        forcing: [N, 4, 12, Hp, Wp]
-        """
-        # 1. Extract strictly oriented +/- d_k neighbors for each fiber
-        u_pos = torch.stack([
-            u_pad[:, 0, :, 1:-1, 2:  ],  # 0 deg   (East)
-            u_pad[:, 1, :, :-2,  2:  ],  # 45 deg  (NE)
-            u_pad[:, 2, :, 2:,   1:-1],  # 90 deg  (South)
-            u_pad[:, 3, :, 2:,   2:  ],  # 135 deg (SE)
+    def _compute_gates(self, u: torch.Tensor, forcing: torch.Tensor):
+        N, K, D, Hp, Wp = u.shape
+        uf = torch.cat([u, forcing], dim=2).reshape(N * K, D + forcing.shape[2], Hp, Wp)
+        gates = torch.sigmoid(self.gate_conv(uf)).view(N, K, 2 * D, Hp, Wp)
+        p, a = gates.split(D, dim=2)
+        return p, a
+
+    def _step_from_padded(self, u: torch.Tensor, p: torch.Tensor, a: torch.Tensor,
+                          up_pad: torch.Tensor, forcing: torch.Tensor,
+                          rel_depth: float, is_finest: float) -> torch.Tensor:
+        N, K, D, Hp, Wp = u.shape
+
+        # 1. Extract strictly oriented +/- d_k neighbors for [u, p] together (1 halo gather!)
+        up_pos = torch.stack([
+            up_pad[:, 0, :, 1:-1, 2:  ],  # 0 deg   (East)
+            up_pad[:, 1, :, :-2,  2:  ],  # 45 deg  (NE)
+            up_pad[:, 2, :, 2:,   1:-1],  # 90 deg  (South)
+            up_pad[:, 3, :, 2:,   2:  ],  # 135 deg (SE)
         ], dim=1)
-        u_neg = torch.stack([
-            u_pad[:, 0, :, 1:-1, :-2 ],  # 0 deg   (West)
-            u_pad[:, 1, :, 2:,   :-2 ],  # 45 deg  (SW)
-            u_pad[:, 2, :, :-2,  1:-1],  # 90 deg  (North)
-            u_pad[:, 3, :, :-2,  :-2 ],  # 135 deg (NW)
+        up_neg = torch.stack([
+            up_pad[:, 0, :, 1:-1, :-2 ],  # 0 deg   (West)
+            up_pad[:, 1, :, 2:,   :-2 ],  # 45 deg  (SW)
+            up_pad[:, 2, :, :-2,  1:-1],  # 90 deg  (North)
+            up_pad[:, 3, :, :-2,  :-2 ],  # 135 deg (NW)
         ], dim=1)
 
-        # Move channel dim last for C4 weight-shared Linear ops: [N, 4, Hp, Wp, C]
-        u_c = u.permute(0, 1, 3, 4, 2)
-        f_c = forcing.permute(0, 1, 3, 4, 2)
-        dp = u_pos.permute(0, 1, 3, 4, 2) - u_c
-        dn = u_neg.permute(0, 1, 3, 4, 2) - u_c
+        u_pos, p_pos = up_pos.split(D, dim=2)
+        u_neg, p_neg = up_neg.split(D, dim=2)
 
-        # 2. Gated anisotropic transport along theta_k (180°-symmetric sum + abs-diff)
-        gp = torch.sigmoid(self.cond_gate(torch.cat([u_c, dp, f_c], dim=-1)))
-        gn = torch.sigmoid(self.cond_gate(torch.cat([u_c, dn, f_c], dim=-1)))
-        fp = gp * dp
-        fn = gn * dn
+        # 2. Conservative symmetric anisotropic flux g_ij = p_i * p_j along theta_k
+        fp = (p * p_pos) * (u_pos - u)
+        fn = (p * p_neg) * (u_neg - u)
         diff_flux = fp + fn
         grad_flux = torch.abs(fp - fn)
 
-        # 3. Smooth angular coupling ONLY with k-1 and k+1 (NEVER orthogonal k+2!)
-        u_prev = torch.roll(u_c, shifts=1, dims=1)
-        u_next = torch.roll(u_c, shifts=-1, dims=1)
-        d_ang = 0.5 * (u_prev + u_next) - u_c
-        g_ang = torch.sigmoid(self.ang_gate(torch.cat([u_c, d_ang, f_c], dim=-1)))
-        ang_flux = g_ang * d_ang
+        # 3. Conservative angular coupling ONLY with k-1 and k+1 (ZERO 0° <-> 90° bleed!)
+        u_prev = torch.roll(u, shifts=1, dims=1)
+        a_prev = torch.roll(a, shifts=1, dims=1)
+        u_next = torch.roll(u, shifts=-1, dims=1)
+        a_next = torch.roll(a, shifts=-1, dims=1)
+        ang_flux = (a * a_prev) * (u_prev - u) + (a * a_next) * (u_next - u)
 
-        # 4. Continuous resolution-agnostic scale conditioning
-        scale_feat = torch.empty(*u_c.shape[:-1], 2, device=u.device, dtype=u.dtype)
-        scale_feat[..., 0] = rel_depth
-        scale_feat[..., 1] = is_finest
+        # 4. Resolution-agnostic scale channels in NCHW
+        scale_feat = torch.empty(N, K, 2, Hp, Wp, device=u.device, dtype=u.dtype)
+        scale_feat[:, :, 0] = rel_depth
+        scale_feat[:, :, 1] = is_finest
 
-        # 5. Damped PDE update
-        x = torch.cat([u_c, diff_flux, grad_flux, ang_flux, f_c, scale_feat], dim=-1)
-        du = self.react(self.norm(x)).permute(0, 1, 4, 2, 3)  # [N, 4, D, Hp, Wp]
+        # 5. Zero-copy NCHW reaction update
+        x = torch.cat([u, diff_flux, grad_flux, ang_flux, forcing, scale_feat], dim=2)
+        x = x.reshape(N * K, x.shape[2], Hp, Wp)
+        du = self.react(self.norm(x)).view(N, K, D, Hp, Wp)
         dt = 0.5 * torch.sigmoid(self.dt_logit)
         return u + dt * du
 
     def smooth_bricks(self, u: torch.Tensor, lvl: QuadtreeLevel,
-                      rel_depth: float, is_finest: float, steps: int = 2) -> torch.Tensor:
+                      rel_depth: float, is_finest: float, steps: int = 1) -> torch.Tensor:
         for _ in range(steps):
-            u_pad = gather_brick_halo(u, lvl)
-            u = self._step_from_padded(u, u_pad, lvl.forcing, rel_depth, is_finest)
+            p, a = self._compute_gates(u, lvl.forcing)
+            up_pad = gather_brick_halo_fast(torch.cat([u, p], dim=2), lvl.nb_idx)
+            u = self._step_from_padded(u, p, a, up_pad, lvl.forcing, rel_depth, is_finest)
         return u
 
     def smooth_dense(self, u: torch.Tensor, forcing: torch.Tensor,
-                     rel_depth: float, is_finest: float, steps: int = 2) -> torch.Tensor:
+                     rel_depth: float, is_finest: float, steps: int = 1) -> torch.Tensor:
         for _ in range(steps):
-            u_pad = F.pad(u, (1, 1, 1, 1))
-            u = self._step_from_padded(u, u_pad, forcing, rel_depth, is_finest)
+            p, a = self._compute_gates(u, forcing)
+            up_pad = F.pad(torch.cat([u, p], dim=2), (1, 1, 1, 1))
+            u = self._step_from_padded(u, p, a, up_pad, forcing, rel_depth, is_finest)
         return u
 
 
 class HaizkLow(nn.Module):
-    """
-    Standalone Adaptive Morton-Quadtree + SE(2) Fiber Multigrid Architecture.
-    """
-    def __init__(self, d_fiber: int = 16, hidden: int = 48, n_vcycles: int = 3,
-                 smooth_steps: int = 2, tile_size: int = 4, root_bricks: int = 8,
+    def __init__(self, d_fiber: int = 16, hidden: int = 48, n_vcycles: int = 2,
+                 smooth_steps: int = 1, tile_size: int = 4, root_bricks: int = 8,
                  use_checkpoint: bool = False):
         super().__init__()
         self.d_fiber = d_fiber
@@ -212,61 +194,52 @@ class HaizkLow(nn.Module):
         self.use_checkpoint = use_checkpoint
 
         self.pyramid = MultiStatSE2Pyramid(tile_size=tile_size, root_bricks=root_bricks)
-
-        # Init state from raw forcing I_k
-        self.init_proj = nn.Linear(12, d_fiber)
-
-        # ONE shared SE(2) smoother across all levels and all V-cycles!
+        self.init_proj = nn.Conv2d(12, d_fiber, kernel_size=1)
         self.smoother = SE2AnisotropicSmoother(d_fiber=d_fiber, f_ch=12, hidden=hidden)
 
-        # Shared Morton [8x8 <-> 4x4] Restriction & Prolongation (applied per fiber)
         self.restrict_conv = nn.Conv2d(d_fiber, d_fiber, kernel_size=2, stride=2)
         self.prolong_conv = nn.Conv2d(d_fiber, d_fiber, kernel_size=3, padding=1)
         self.rp_scale = nn.Parameter(torch.tensor(0.25))
 
-        # Brick Split Predictor (predicts whether a 4x4 brick needs subdivision)
+        # Scale-aware brick split predictor (knows rel_depth so each level learns exact sparsity!)
         self.split_head = nn.Sequential(
-            nn.Linear(2 * d_fiber + 12, 32),
+            nn.Linear(2 * d_fiber + 12 + 1, 32),
             nn.GELU(),
             nn.Linear(32, 1),
         )
-        # Negative bias keeps empty background OFF on Step 1 (Union Warmup keeps 100% of GT vessels ON!)
         nn.init.constant_(self.split_head[-1].bias, -1.0)
 
-        # Fiber Output Head (each fiber independently predicts [Artery, Vein] logits)
-        self.out_head = nn.Linear(d_fiber, 2)
-        self.lse_beta = 4.0  # Smooth-max sharpness for crossing-preserving fiber collapse
+        self.out_head = nn.Conv2d(d_fiber, 2, kernel_size=1)
+        self.lse_beta = 4.0
 
-        # Precompute L0 (8x8) Morton permutation tables
         G0 = root_bricks
         codes = [_morton2d(r % G0, r // G0) for r in range(G0 * G0)]
         morton_perm = torch.tensor(sorted(range(G0 * G0), key=lambda r: codes[r]), dtype=torch.long)
         inv_perm = torch.argsort(morton_perm)
-        by0 = morton_perm // G0
-        bx0 = morton_perm % G0
         self.register_buffer("l0_morton_perm", morton_perm)
         self.register_buffer("l0_inv_perm", inv_perm)
-        self.register_buffer("l0_by", by0)
-        self.register_buffer("l0_bx", bx0)
+        self.register_buffer("l0_by", morton_perm // G0)
+        self.register_buffer("l0_bx", morton_perm % G0)
         self.register_buffer("l0_codes", torch.arange(G0 * G0, dtype=torch.long))
 
+    def _init_state(self, f: torch.Tensor) -> torch.Tensor:
+        N, K, C, T, _ = f.shape
+        return self.init_proj(f.reshape(N * K, C, T, T)).view(N, K, self.d_fiber, T, T)
+
     def _gather_forcing_bricks(self, pyr_l: torch.Tensor, b_idx, by_idx, bx_idx) -> torch.Tensor:
-        # pyr_l: [B, 4, 12, G*T, G*T] -> [N, 4, 12, T, T]
         B, K, C, H, W = pyr_l.shape
         T = self.tile_size
         G = H // T
-        bricks = pyr_l.view(B, K, C, G, T, G, T).permute(0, 3, 5, 1, 2, 4, 6)
-        return bricks[b_idx, by_idx, bx_idx]
+        return pyr_l.view(B, K, C, G, T, G, T).permute(0, 3, 5, 1, 2, 4, 6)[b_idx, by_idx, bx_idx]
 
-    def _predict_split_logits(self, u: torch.Tensor, forcing: torch.Tensor) -> torch.Tensor:
-        # u: [N, 4, D, T, T], forcing: [N, 4, 12, T, T] -> [N]
-        u_mean = u.mean(dim=(1, 3, 4))                      # [N, D]
-        u_max = u.amax(dim=(1, 3, 4))                       # [N, D]
-        f_max = forcing.amax(dim=(1, 3, 4))                 # [N, 12]
-        return self.split_head(torch.cat([u_mean, u_max, f_max], dim=-1)).squeeze(-1)
+    def _predict_split_logits(self, u: torch.Tensor, forcing: torch.Tensor, rel_depth: float) -> torch.Tensor:
+        u_mean = u.mean(dim=(1, 3, 4))
+        u_max = u.amax(dim=(1, 3, 4))
+        f_max = forcing.amax(dim=(1, 3, 4))
+        depth_col = torch.full((u.shape[0], 1), rel_depth, device=u.device, dtype=u.dtype)
+        return self.split_head(torch.cat([u_mean, u_max, f_max, depth_col], dim=-1)).squeeze(-1)
 
     def _prolongate_to_children(self, parent_u: torch.Tensor, p_sel: torch.Tensor) -> torch.Tensor:
-        # parent_u[p_sel]: [M, 4, D, 4, 4] -> children delta [4*M, 4, D, 4, 4]
         M, K, D, T, _ = parent_u[p_sel].shape
         p = parent_u[p_sel].reshape(M * K, D, T, T)
         up = self.prolong_conv(F.interpolate(p, scale_factor=2, mode="bilinear", align_corners=False))
@@ -274,7 +247,6 @@ class HaizkLow(nn.Module):
 
     def _restrict_to_parent(self, child_u: torch.Tensor, parent_u: torch.Tensor,
                             p_sel: torch.Tensor) -> torch.Tensor:
-        # child_u: [4*M, 4, D, 4, 4] -> add restricted residual to parent_u[p_sel]
         M = p_sel.numel()
         _, K, D, T, _ = child_u.shape
         x8 = child_u.view(M, 2, 2, K, D, T, T).permute(0, 3, 4, 1, 5, 2, 6).reshape(M * K, D, 2 * T, 2 * T)
@@ -296,30 +268,24 @@ class HaizkLow(nn.Module):
 
     def _coarse_global_solve(self, u0_bricks: torch.Tensor, f32: torch.Tensor,
                              sub_coarse: List[torch.Tensor]) -> torch.Tensor:
-        """
-        Mini-V solve below L0: 32x32 -> 16x16 -> 8x8 (global!) -> 16x16 -> 32x32.
-        Gives full-image global receptive field on V-Cycle #1 with zero Self-Attention!
-        """
         B, K, D = f32.shape[0], 4, self.d_fiber
         f16, f8 = sub_coarse
 
         u32 = self._l0_bricks_to_dense(u0_bricks, B)
         u32 = self.smoother.smooth_dense(u32, f32, rel_depth=0.0, is_finest=0.0, steps=self.smooth_steps)
 
-        # Restrict 32 -> 16 -> 8
         u16 = self.restrict_conv(u32.reshape(B * K, D, 32, 32)).view(B, K, D, 16, 16)
-        u16 = self.smoother.smooth_dense(u16, f16, rel_depth=-0.25, is_finest=0.0, steps=2)
+        u16 = self.smoother.smooth_dense(u16, f16, rel_depth=-0.25, is_finest=0.0, steps=1)
 
         u8 = self.restrict_conv(u16.reshape(B * K, D, 16, 16)).view(B, K, D, 8, 8)
-        u8 = self.smoother.smooth_dense(u8, f8, rel_depth=-0.5, is_finest=0.0, steps=4)
+        u8 = self.smoother.smooth_dense(u8, f8, rel_depth=-0.5, is_finest=0.0, steps=3)
 
-        # Prolongate 8 -> 16 -> 32
         up16 = self.prolong_conv(F.interpolate(u8.reshape(B * K, D, 8, 8), scale_factor=2, mode="bilinear", align_corners=False))
-        u16 = u16 + self.rp_scale * up16.view(B, K, D, 16, 16)
-        u16 = self.smoother.smooth_dense(u16, f16, rel_depth=-0.25, is_finest=0.0, steps=2)
+        u16 = u16 + (self.rp_scale * up16.view(B, K, D, 16, 16)).to(u16.dtype)
+        u16 = self.smoother.smooth_dense(u16, f16, rel_depth=-0.25, is_finest=0.0, steps=1)
 
         up32 = self.prolong_conv(F.interpolate(u16.reshape(B * K, D, 16, 16), scale_factor=2, mode="bilinear", align_corners=False))
-        u32 = u32 + self.rp_scale * up32.view(B, K, D, 32, 32)
+        u32 = u32 + (self.rp_scale * up32.view(B, K, D, 32, 32)).to(u32.dtype)
         u32 = self.smoother.smooth_dense(u32, f32, rel_depth=0.0, is_finest=0.0, steps=self.smooth_steps)
 
         return self._dense_to_l0_bricks(u32)
@@ -329,22 +295,19 @@ class HaizkLow(nn.Module):
         n_lvls = len(levels)
         states = list(states)
 
-        # 1. Downward leg (Finest -> L1): Pre-smooth + Restrict residuals to parent
         for l in range(n_lvls - 1, 0, -1):
             rel_d = l / max(n_lvls - 1, 1)
             is_f = 1.0 if l == n_lvls - 1 else 0.0
             states[l] = self.smoother.smooth_bricks(states[l], levels[l], rel_d, is_f, steps=self.smooth_steps)
             states[l - 1] = self._restrict_to_parent(states[l], states[l - 1], levels[l].parent_sel)
 
-        # 2. Bottom of V: Global Coarse Solve at L0 (32 -> 16 -> 8 -> 16 -> 32)
         states[0] = self._coarse_global_solve(states[0], pyr[0], sub_coarse)
 
-        # 3. Upward leg (L1 -> Finest): Prolongate coarse correction + Post-smooth
         for l in range(1, n_lvls):
             rel_d = l / max(n_lvls - 1, 1)
             is_f = 1.0 if l == n_lvls - 1 else 0.0
             delta = self._prolongate_to_children(states[l - 1], levels[l].parent_sel)
-            states[l] = states[l] + self.rp_scale * delta
+            states[l] = states[l] + (self.rp_scale * delta).to(states[l].dtype)
             states[l] = self.smoother.smooth_bricks(states[l], levels[l], rel_d, is_f, steps=self.smooth_steps)
 
         return states
@@ -359,14 +322,14 @@ class HaizkLow(nn.Module):
         for l in range(len(levels) - 1, -1, -1):
             lvl = levels[l]
             u = states[l]
-            f_logits = self.out_head(u.permute(0, 1, 3, 4, 2)).float()     # [N, 4, T, T, 2]
-            beta = self.lse_beta
-            brick_logits = (torch.logsumexp(beta * f_logits, dim=1) / beta).permute(0, 3, 1, 2)
+            N, K, D, _, _ = u.shape
+            f_logits = self.out_head(u.reshape(N * K, D, T, T)).view(N, K, 2, T, T).float()
+            brick_logits = torch.logsumexp(self.lse_beta * f_logits, dim=1) / self.lse_beta  # [N, 2, T, T]
 
             G = lvl.grid_size
             grid = torch.zeros(B, G, G, 2, T, T, device=device, dtype=torch.float32)
             mask = torch.zeros(B, G, G, 1, T, T, device=device, dtype=torch.float32)
-            ones = torch.ones(u.shape[0], 1, T, T, device=device, dtype=torch.float32)
+            ones = torch.ones(N, 1, T, T, device=device, dtype=torch.float32)
 
             grid = grid.index_put((lvl.b_idx, lvl.by_idx, lvl.bx_idx), brick_logits)
             mask = mask.index_put((lvl.b_idx, lvl.by_idx, lvl.bx_idx), ones)
@@ -385,7 +348,7 @@ class HaizkLow(nn.Module):
         return out
 
     def forward(self, img: torch.Tensor, gt_split_masks: Optional[List[torch.Tensor]] = None,
-                union_prob: float = 0.0, split_thresh: float = 0.45,
+                union_prob: float = 0.0, split_thresh: float = 0.55,
                 adaptive_exit_eps: Optional[float] = None):
         B, _, H, W = img.shape
         device = img.device
@@ -400,19 +363,17 @@ class HaizkLow(nn.Module):
         m0 = self.l0_codes.repeat(B)
         bmap0 = torch.full((B, G0, G0), -1, device=device, dtype=torch.long)
         bmap0[b0, by0, bx0] = torch.arange(B * G0 * G0, device=device)
+        nb0 = precompute_neighbor_table(b0, by0, bx0, bmap0, G0)
 
         f0 = self._gather_forcing_bricks(pyr[0], b0, by0, bx0)
-        u0 = self.init_proj(f0.permute(0, 1, 3, 4, 2)).permute(0, 1, 4, 2, 3)
-
-        lvl0 = QuadtreeLevel(G0, b0, by0, bx0, m0, bmap0, None, f0, u0)
-        u0 = self.smoother.smooth_bricks(u0, lvl0, rel_depth=0.0, is_finest=0.0, steps=1)
-        lvl0.state = u0
+        u0 = self._init_state(f0)
+        lvl0 = QuadtreeLevel(G0, b0, by0, bx0, m0, bmap0, nb0, None, f0, u0)
+        lvl0.state = self.smoother.smooth_bricks(u0, lvl0, rel_depth=0.0, is_finest=0.0, steps=1)
 
         levels = [lvl0]
         split_logits_list = []
         split_targets_list = []
 
-        # Sample which batch items use Union Warmup (GT | Pred) vs pure Pred
         if self.training and gt_split_masks is not None and union_prob > 0.0:
             use_union = (torch.rand(B, device=device) < union_prob)
         else:
@@ -420,40 +381,27 @@ class HaizkLow(nn.Module):
 
         for l in range(n_lvls - 1):
             cur = levels[l]
-            s_logits = self._predict_split_logits(cur.state, cur.forcing)  # [N_l]
+            rel_d_cur = l / max(n_lvls - 1, 1)
+            s_logits = self._predict_split_logits(cur.state, cur.forcing, rel_d_cur)
             split_logits_list.append(s_logits)
 
             pred_mask = (torch.sigmoid(s_logits) > split_thresh)
             if gt_split_masks is not None:
-                gt_s = gt_split_masks[l][cur.b_idx, cur.by_idx, cur.bx_idx]  # [N_l]
+                gt_s = gt_split_masks[l][cur.b_idx, cur.by_idx, cur.bx_idx]
                 split_targets_list.append(gt_s)
-                gt_bool = (gt_s > 0.5)
-                split_mask = torch.where(use_union[cur.b_idx], pred_mask | gt_bool, pred_mask)
+                split_mask = torch.where(use_union[cur.b_idx], pred_mask | (gt_s > 0.5), pred_mask)
             else:
                 split_mask = pred_mask
 
-            # Hard VRAM safety cap during training: never split >50% of bricks at fine levels
-            if self.training and l >= 1:
-                max_m = max(B, int(0.50 * cur.b_idx.numel()))
-                if split_mask.sum().item() > max_m:
-                    topk_idx = torch.topk(s_logits, k=max_m).indices
-                    cap_mask = torch.zeros_like(split_mask)
-                    cap_mask[topk_idx] = True
-                    split_mask = cap_mask
+            # Safety guard: ensure at least 1 brick splits globally (avoids 24x per-batch GPU syncs!)
+            if not split_mask.any():
+                split_mask[s_logits.argmax()] = True
 
-            # Safety guard: ensure >= 1 brick splits per batch item so M >= B always
-            for b in range(B):
-                b_sel = (cur.b_idx == b)
-                if not (split_mask & b_sel).any():
-                    b_indices = torch.where(b_sel)[0]
-                    best_i = b_indices[s_logits[b_indices].argmax()]
-                    split_mask[best_i] = True
-
-            # Zero-Sort Morton Expansion: sorted parents -> 4 contiguous sorted children!
-            p_sel = torch.where(split_mask)[0]                             # [M]
+            # Zero-Sort Morton Expansion
+            p_sel = torch.where(split_mask)[0]
             M = p_sel.numel()
-            c_parent = p_sel.repeat_interleave(4)                          # [4*M]
-            c_q = torch.arange(4, device=device).repeat(M)                 # [4*M]
+            c_parent = p_sel.repeat_interleave(4)
+            c_q = torch.arange(4, device=device).repeat(M)
             c_b = cur.b_idx[c_parent]
             c_bx = cur.bx_idx[c_parent] * 2 + (c_q & 1)
             c_by = cur.by_idx[c_parent] * 2 + ((c_q >> 1) & 1)
@@ -462,19 +410,18 @@ class HaizkLow(nn.Module):
             G_next = cur.grid_size * 2
             bmap_next = torch.full((B, G_next, G_next), -1, device=device, dtype=torch.long)
             bmap_next[c_b, c_by, c_bx] = torch.arange(4 * M, device=device)
+            nb_next = precompute_neighbor_table(c_b, c_by, c_bx, bmap_next, G_next)
 
             f_next = self._gather_forcing_bricks(pyr[l + 1], c_b, c_by, c_bx)
-            u_init = self.init_proj(f_next.permute(0, 1, 3, 4, 2)).permute(0, 1, 4, 2, 3)
-            u_next = u_init + self.rp_scale * self._prolongate_to_children(cur.state, p_sel)
+            u_next = self._init_state(f_next) + (self.rp_scale * self._prolongate_to_children(cur.state, p_sel)).to(f_next.dtype)
 
-            lvl_next = QuadtreeLevel(G_next, c_b, c_by, c_bx, c_morton, bmap_next, p_sel, f_next, u_next)
+            lvl_next = QuadtreeLevel(G_next, c_b, c_by, c_bx, c_morton, bmap_next, nb_next, p_sel, f_next, u_next)
             rel_d = (l + 1) / max(n_lvls - 1, 1)
             is_f = 1.0 if (l + 1) == n_lvls - 1 else 0.0
-            u_next = self.smoother.smooth_bricks(u_next, lvl_next, rel_d, is_f, steps=1)
-            lvl_next.state = u_next
+            lvl_next.state = self.smoother.smooth_bricks(u_next, lvl_next, rel_d, is_f, steps=1)
             levels.append(lvl_next)
 
-        # ---- Stage 2: Weight-Tied Multigrid V-Cycles (with Deep Supervision & Adaptive Exit) ----
+        # ---- Stage 2: Weight-Tied Multigrid V-Cycles ----
         states = [lvl.state for lvl in levels]
         cycle_logits = []
         cycles_used = 0
@@ -491,13 +438,10 @@ class HaizkLow(nn.Module):
 
             cycles_used = k + 1
             if self.training or k == self.n_vcycles - 1 or adaptive_exit_eps is not None:
-                logits_k = self._decode_quadtree_logits(states, levels, B, H, W)
-                cycle_logits.append(logits_k)
+                cycle_logits.append(self._decode_quadtree_logits(states, levels, B, H, W))
 
-            # Adaptive Test-Time Early Exit when PDE residual converges!
             if (not self.training) and adaptive_exit_eps is not None and k >= 1:
-                delta_norm = (states[-1] - prev_finest).abs().mean().item()
-                if delta_norm < adaptive_exit_eps:
+                if (states[-1] - prev_finest).abs().mean().item() < adaptive_exit_eps:
                     break
 
         finest = levels[-1]

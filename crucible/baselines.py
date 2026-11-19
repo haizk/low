@@ -18,7 +18,6 @@ class GhostModule(nn.Module):
         )
         self.cheap = nn.Sequential(
             nn.Conv2d(init_ch, cheap_ch, 3, padding=1, groups=init_ch, bias=False),
-            nn.BatchNorm2d(cheap_ch),
             nn.ReLU(inplace=True),
         )
 

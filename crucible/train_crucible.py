@@ -104,7 +104,7 @@ def train_one(name, model, train_loader, val_loader, device, epochs=25, lr=2e-3,
                         for sl, st in zip(out["split_logits"], out["split_targets"])
                     ) / len(out["split_logits"])
 
-                    loss = seg_loss + 0.30 * split_loss
+                    loss = seg_loss + 1.0 * split_loss
                     act_sum += out["active_ratio"] * 100.0
                 else:
                     out = model(img)
@@ -153,21 +153,21 @@ def main():
         torch.cuda.empty_cache()
 
     haizk = train_one(
-        "HaizkLow (D=16, K=3)",
-        HaizkLow(d_fiber=16, hidden=48, n_vcycles=3, smooth_steps=2, use_checkpoint=True),
-        train_loader, val256_loader, device, epochs=25, lr=2e-3, is_haizklow=True
+        "HaizkLow (D=16, K=2)",
+        HaizkLow(d_fiber=16, hidden=48, n_vcycles=2, smooth_steps=1, use_checkpoint=False),
+        train_loader, val256_loader, device, epochs=25, lr=3e-3, is_haizklow=True
     )
 
     print("\n================ ZERO-SHOT EXTRAPOLATION SHOWDOWN (Trained ONLY on 256x256!) ================")
     for tag, loader in [("512x512 Resolution Jump", val512_res_loader),
                         ("512x512 2x Path-Length Torture", val512_len_loader)]:
         r_hu = benchmark_model(half_unet, loader, device, is_haizklow=False)
-        r_hl3 = benchmark_model(haizk, loader, device, is_haizklow=True, n_vcycles_eval=3)
-        r_hl6 = benchmark_model(haizk, loader, device, is_haizklow=True, n_vcycles_eval=6)
+        r_hl2 = benchmark_model(haizk, loader, device, is_haizklow=True, n_vcycles_eval=2)
+        r_hl4 = benchmark_model(haizk, loader, device, is_haizklow=True, n_vcycles_eval=4)
         print(f"\n--- {tag} ---")
         print(f"  Half-UNet     : AV_Dice={r_hu['av_dice']:.4f} | Cross_F1={r_hu['crossing_f1']:.4f} | Thin1px={r_hu['thin_recall']:.4f} | Active=100.0% | {r_hu['ms_per_img']:.1f} ms")
-        print(f"  HaizkLow (K=3): AV_Dice={r_hl3['av_dice']:.4f} | Cross_F1={r_hl3['crossing_f1']:.4f} | Thin1px={r_hl3['thin_recall']:.4f} | Active={r_hl3['active_pct']:.1f}% | {r_hl3['ms_per_img']:.1f} ms")
-        print(f"  HaizkLow (K=6): AV_Dice={r_hl6['av_dice']:.4f} | Cross_F1={r_hl6['crossing_f1']:.4f} | Thin1px={r_hl6['thin_recall']:.4f} | Active={r_hl6['active_pct']:.1f}% | {r_hl6['ms_per_img']:.1f} ms")
+        print(f"  HaizkLow (K=2): AV_Dice={r_hl2['av_dice']:.4f} | Cross_F1={r_hl2['crossing_f1']:.4f} | Thin1px={r_hl2['thin_recall']:.4f} | Active={r_hl2['active_pct']:.1f}% | {r_hl2['ms_per_img']:.1f} ms")
+        print(f"  HaizkLow (K=4): AV_Dice={r_hl4['av_dice']:.4f} | Cross_F1={r_hl4['crossing_f1']:.4f} | Thin1px={r_hl4['thin_recall']:.4f} | Active={r_hl4['active_pct']:.1f}% | {r_hl4['ms_per_img']:.1f} ms")
 
 
 if __name__ == "__main__":
