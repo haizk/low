@@ -50,7 +50,8 @@ def benchmark_model(model, loader, device, is_haizklow=False, n_vcycles_eval=Non
         if device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
-        out = model(img)
+        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=(device.type == "cuda")):
+            out = model(img)
         if device.type == "cuda":
             torch.cuda.synchronize()
         t_ms += (time.perf_counter() - t0) * 1000.0 / img.shape[0]
@@ -71,6 +72,7 @@ def train_one(name, model, train_loader, val_loader, device, epochs=25, lr=2e-3,
     model = model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
     print(f"\n================ Training {name} ({count_params(model):,} params) ================")
 
     for ep in range(1, epochs + 1):
@@ -85,32 +87,35 @@ def train_one(name, model, train_loader, val_loader, device, epochs=25, lr=2e-3,
             tgt = batch["target"].to(device)
             opt.zero_grad(set_to_none=True)
 
-            if is_haizklow:
-                gt_splits = batch_gt_split_masks(tgt, model.tile_size, model.root_bricks)
-                out = model(img, gt_split_masks=gt_splits, union_prob=union_prob)
+            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=(device.type == "cuda")):
+                if is_haizklow:
+                    gt_splits = batch_gt_split_masks(tgt, model.tile_size, model.root_bricks)
+                    out = model(img, gt_split_masks=gt_splits, union_prob=union_prob)
 
-                # Deep supervision across all V-cycles (later cycles weighted heavier)
-                n_c = len(out["cycle_logits"])
-                weights = [(i + 1) / n_c for i in range(n_c)]
-                w_sum = sum(weights)
-                seg_loss = sum(w * av_seg_loss(lg, tgt) for w, lg in zip(weights, out["cycle_logits"])) / w_sum
+                    # Deep supervision across all V-cycles (later cycles weighted heavier)
+                    n_c = len(out["cycle_logits"])
+                    weights = [(i + 1) / n_c for i in range(n_c)]
+                    w_sum = sum(weights)
+                    seg_loss = sum(w * av_seg_loss(lg, tgt) for w, lg in zip(weights, out["cycle_logits"])) / w_sum
 
-                # Split BCE supervision across Quadtree levels
-                split_loss = sum(
-                    F.binary_cross_entropy_with_logits(sl, st)
-                    for sl, st in zip(out["split_logits"], out["split_targets"])
-                ) / len(out["split_logits"])
+                    # Split BCE supervision across Quadtree levels
+                    split_loss = sum(
+                        F.binary_cross_entropy_with_logits(sl.float(), st.float())
+                        for sl, st in zip(out["split_logits"], out["split_targets"])
+                    ) / len(out["split_logits"])
 
-                loss = seg_loss + 0.30 * split_loss
-                act_sum += out["active_ratio"] * 100.0
-            else:
-                out = model(img)
-                loss = av_seg_loss(out["logits"], tgt)
-                act_sum += 100.0
+                    loss = seg_loss + 0.30 * split_loss
+                    act_sum += out["active_ratio"] * 100.0
+                else:
+                    out = model(img)
+                    loss = av_seg_loss(out["logits"], tgt)
+                    act_sum += 100.0
 
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             loss_sum += loss.item()
 
         sched.step()
@@ -143,8 +148,13 @@ def main():
         "Half-UNet (C=32)", HalfUNet(base_ch=32),
         train_loader, val256_loader, device, epochs=25, lr=2e-3, is_haizklow=False
     )
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     haizk = train_one(
-        "HaizkLow (D=16, K=3)", HaizkLow(d_fiber=16, hidden=48, n_vcycles=3, smooth_steps=2),
+        "HaizkLow (D=16, K=3)",
+        HaizkLow(d_fiber=16, hidden=48, n_vcycles=3, smooth_steps=2, use_checkpoint=True),
         train_loader, val256_loader, device, epochs=25, lr=2e-3, is_haizklow=True
     )
 

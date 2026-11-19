@@ -230,8 +230,8 @@ class HaizkLow(nn.Module):
             nn.GELU(),
             nn.Linear(32, 1),
         )
-        # Slightly positive bias prevents empty-tree collapse at Epoch 1
-        nn.init.constant_(self.split_head[-1].bias, 1.0)
+        # Negative bias keeps empty background OFF on Step 1 (Union Warmup keeps 100% of GT vessels ON!)
+        nn.init.constant_(self.split_head[-1].bias, -1.0)
 
         # Fiber Output Head (each fiber independently predicts [Artery, Vein] logits)
         self.out_head = nn.Linear(d_fiber, 2)
@@ -280,7 +280,7 @@ class HaizkLow(nn.Module):
         x8 = child_u.view(M, 2, 2, K, D, T, T).permute(0, 3, 4, 1, 5, 2, 6).reshape(M * K, D, 2 * T, 2 * T)
         r = self.restrict_conv(x8).view(M, K, D, T, T)
         new_parent = parent_u.clone()
-        new_parent[p_sel] = parent_u[p_sel] + self.rp_scale * r
+        new_parent[p_sel] = parent_u[p_sel] + (self.rp_scale * r).to(parent_u.dtype)
         return new_parent
 
     def _l0_bricks_to_dense(self, u0: torch.Tensor, B: int) -> torch.Tensor:
@@ -351,29 +351,22 @@ class HaizkLow(nn.Module):
 
     def _decode_quadtree_logits(self, states: List[torch.Tensor], levels: List[QuadtreeLevel],
                                 B: int, H: int, W: int) -> torch.Tensor:
-        """
-        100% differentiable Finest-to-Coarsest Leaf Compositor + Smooth-Max SE(2) Fiber Collapse.
-        Allows BOTH Artery and Vein to fire simultaneously on orthogonal fibers at crossings!
-        """
         device = states[0].device
-        dtype = states[0].dtype
         T = self.tile_size
-        out = torch.zeros(B, 2, H, W, device=device, dtype=dtype)
-        covered = torch.zeros(B, 1, H, W, device=device, dtype=dtype)
+        out = torch.zeros(B, 2, H, W, device=device, dtype=torch.float32)
+        covered = torch.zeros(B, 1, H, W, device=device, dtype=torch.float32)
 
         for l in range(len(levels) - 1, -1, -1):
             lvl = levels[l]
-            u = states[l]  # [N, 4, D, T, T]
-            # Per-fiber [Artery, Vein] logits -> Smooth-Max across K=4 orientation fibers
-            f_logits = self.out_head(u.permute(0, 1, 3, 4, 2))             # [N, 4, T, T, 2]
+            u = states[l]
+            f_logits = self.out_head(u.permute(0, 1, 3, 4, 2)).float()     # [N, 4, T, T, 2]
             beta = self.lse_beta
-            brick_logits = torch.logsumexp(beta * f_logits, dim=1) / beta  # [N, T, T, 2]
-            brick_logits = brick_logits.permute(0, 3, 1, 2)                # [N, 2, T, T]
+            brick_logits = (torch.logsumexp(beta * f_logits, dim=1) / beta).permute(0, 3, 1, 2)
 
             G = lvl.grid_size
-            grid = torch.zeros(B, G, G, 2, T, T, device=device, dtype=dtype)
-            mask = torch.zeros(B, G, G, 1, T, T, device=device, dtype=dtype)
-            ones = torch.ones(u.shape[0], 1, T, T, device=device, dtype=dtype)
+            grid = torch.zeros(B, G, G, 2, T, T, device=device, dtype=torch.float32)
+            mask = torch.zeros(B, G, G, 1, T, T, device=device, dtype=torch.float32)
+            ones = torch.ones(u.shape[0], 1, T, T, device=device, dtype=torch.float32)
 
             grid = grid.index_put((lvl.b_idx, lvl.by_idx, lvl.bx_idx), brick_logits)
             mask = mask.index_put((lvl.b_idx, lvl.by_idx, lvl.bx_idx), ones)
@@ -438,6 +431,15 @@ class HaizkLow(nn.Module):
                 split_mask = torch.where(use_union[cur.b_idx], pred_mask | gt_bool, pred_mask)
             else:
                 split_mask = pred_mask
+
+            # Hard VRAM safety cap during training: never split >50% of bricks at fine levels
+            if self.training and l >= 1:
+                max_m = max(B, int(0.50 * cur.b_idx.numel()))
+                if split_mask.sum().item() > max_m:
+                    topk_idx = torch.topk(s_logits, k=max_m).indices
+                    cap_mask = torch.zeros_like(split_mask)
+                    cap_mask[topk_idx] = True
+                    split_mask = cap_mask
 
             # Safety guard: ensure >= 1 brick splits per batch item so M >= B always
             for b in range(B):
