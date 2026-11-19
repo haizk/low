@@ -48,21 +48,31 @@ class MultiStatSE2Pyramid(nn.Module):
         return torch.cat([shared, fiber_r, max_all], dim=2)             # [B, 4, 12, H, W]
 
     @torch.no_grad()
+    def _multiscale_ridge(self, lum):
+        """Computes 3x3 oriented ridge at scales 1, 2, 4 so 1px, 3px, and 6px vessels ALL fire!"""
+        H, W = lum.shape[-2:]
+        pos_all = torch.zeros(lum.shape[0], 4, H, W, device=lum.device, dtype=lum.dtype)
+        neg_all = torch.zeros_like(pos_all)
+        cur = lum
+        for s in (1, 2, 4):
+            if s > 1:
+                cur = F.avg_pool2d(cur, 2, 2)
+            r = F.conv2d(cur, self.ridge_kernels, padding=1)
+            rp, rn = F.relu(r), F.relu(-r)
+            if s > 1:
+                rp = F.interpolate(rp, size=(H, W), mode="bilinear", align_corners=False)
+                rn = F.interpolate(rn, size=(H, W), mode="bilinear", align_corners=False)
+            pos_all = torch.maximum(pos_all, rp)
+            neg_all = torch.maximum(neg_all, rn)
+        return pos_all, neg_all
+
+    @torch.no_grad()
     def forward(self, img):
-        """
-        img: [B, 3, H, W] (H == W, power of 2, >= 64)
-        Returns:
-            levels: list of [B, 4, 12, H_l, W_l] from L0 (32x32) down to L_max (HxW)
-            sub_coarse: (f16, f8) for the coarse mini-V global solve (16x16 and 8x8)
-        """
         B, C, H, W = img.shape
         assert H == W and H >= self.root_res and (H & (H - 1)) == 0, "H=W must be power of 2 >= 32"
 
-        # Compute oriented ridges at finest resolution so 1px capillaries survive pooling!
-        lum = (img * self.luma_w).sum(dim=1, keepdim=True)              # [B, 1, H, W]
-        r = F.conv2d(lum, self.ridge_kernels, padding=1)                # [B, 4, H, W]
-        pos_r = F.relu(r)
-        neg_r = F.relu(-r)
+        lum = (img * self.luma_w).sum(dim=1, keepdim=True)
+        pos_r, neg_r = self._multiscale_ridge(lum)
 
         mean_rgb, max_rgb, min_rgb = img, img, img
         rev_levels = [self._build_level_tensor(mean_rgb, max_rgb, min_rgb, pos_r, neg_r)]
@@ -77,9 +87,7 @@ class MultiStatSE2Pyramid(nn.Module):
             rev_levels.append(self._build_level_tensor(mean_rgb, max_rgb, min_rgb, pos_r, neg_r))
             cur_res //= 2
 
-        levels = list(reversed(rev_levels))  # [L0(32), L1(64), ..., L_max(H)]
-
-        # Two tiny sub-coarse levels (16x16 and 8x8) for instant full-image global receptive field
+        levels = list(reversed(rev_levels))
         sub_coarse = []
         for _ in range(2):
             mean_rgb = F.avg_pool2d(mean_rgb, 2, 2)
@@ -89,4 +97,4 @@ class MultiStatSE2Pyramid(nn.Module):
             neg_r = F.max_pool2d(neg_r, 2, 2)
             sub_coarse.append(self._build_level_tensor(mean_rgb, max_rgb, min_rgb, pos_r, neg_r))
 
-        return levels, sub_coarse  # sub_coarse = [16x16, 8x8]
+        return levels, sub_coarse

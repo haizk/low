@@ -17,8 +17,7 @@ from haizklow.se2_multigrid import HaizkLow, batch_gt_split_masks
 
 
 def av_seg_loss(logits, target):
-    pos_w = torch.tensor([4.0, 4.0], device=logits.device).view(1, 2, 1, 1)
-    bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_w)
+    bce = F.binary_cross_entropy_with_logits(logits, target)
     prob = torch.sigmoid(logits)
     inter = (prob * target).sum(dim=(0, 2, 3))
     denom = prob.sum(dim=(0, 2, 3)) + target.sum(dim=(0, 2, 3)) + 1e-6
@@ -37,7 +36,7 @@ def benchmark_model(model, loader, device, is_haizklow=False, n_vcycles_eval=Non
     if is_haizklow and n_vcycles_eval is not None:
         model.n_vcycles = n_vcycles_eval
 
-    totals = {"av_dice": 0.0, "crossing_f1": 0.0, "thin_recall": 0.0, "active_pct": 0.0}
+    totals = {"av_dice": 0.0, "av_sep": 0.0, "crossing_f1": 0.0, "thin_recall": 0.0, "active_pct": 0.0}
     n_batches = 0
     t_ms = 0.0
 
@@ -60,6 +59,13 @@ def benchmark_model(model, loader, device, is_haizklow=False, n_vcycles_eval=Non
         for k in ("av_dice", "crossing_f1", "thin_recall"):
             totals[k] += m[k]
         totals["active_pct"] += out.get("active_ratio", 1.0) * 100.0
+
+        a_only = (tgt[:, 0] > 0.5) & (tgt[:, 1] < 0.5)
+        v_only = (tgt[:, 1] > 0.5) & (tgt[:, 0] < 0.5)
+        corr = (out["logits"][:, 0][a_only] > out["logits"][:, 1][a_only]).float().sum() + \
+               (out["logits"][:, 1][v_only] > out["logits"][:, 0][v_only]).float().sum()
+        totals["av_sep"] += (corr / (a_only.sum() + v_only.sum() + 1e-6)).item()
+
         n_batches += 1
 
     if is_haizklow and orig_k is not None:
@@ -123,7 +129,7 @@ def train_one(name, model, train_loader, val_loader, device, epochs=25, lr=2e-3,
             val = benchmark_model(model, val_loader, device, is_haizklow=is_haizklow)
             print(
                 f"Ep {ep:02d}/{epochs} | loss={loss_sum/len(train_loader):.4f} | "
-                f"AV_Dice={val['av_dice']:.4f} | Cross_F1={val['crossing_f1']:.4f} | "
+                f"AV_Dice={val['av_dice']:.4f} | AV_Sep={val['av_sep']:.4f} | Cross_F1={val['crossing_f1']:.4f} | "
                 f"Thin1px={val['thin_recall']:.4f} | Active={val['active_pct']:.1f}% | "
                 f"{val['ms_per_img']:.1f} ms/img"
             )
@@ -153,8 +159,8 @@ def main():
         torch.cuda.empty_cache()
 
     haizk = train_one(
-        "HaizkLow (D=16, K=2)",
-        HaizkLow(d_fiber=16, hidden=48, n_vcycles=2, smooth_steps=1, use_checkpoint=True),
+        "HaizkLow (D=16, K=3)",
+        HaizkLow(d_fiber=16, hidden=48, n_vcycles=3, smooth_steps=1, use_checkpoint=True),
         train_loader, val256_loader, device, epochs=25, lr=3e-3, is_haizklow=True
     )
 
@@ -162,12 +168,12 @@ def main():
     for tag, loader in [("512x512 Resolution Jump", val512_res_loader),
                         ("512x512 2x Path-Length Torture", val512_len_loader)]:
         r_hu = benchmark_model(half_unet, loader, device, is_haizklow=False)
-        r_hl2 = benchmark_model(haizk, loader, device, is_haizklow=True, n_vcycles_eval=2)
-        r_hl4 = benchmark_model(haizk, loader, device, is_haizklow=True, n_vcycles_eval=4)
+        r_hl3 = benchmark_model(haizk, loader, device, is_haizklow=True, n_vcycles_eval=3)
+        r_hl6 = benchmark_model(haizk, loader, device, is_haizklow=True, n_vcycles_eval=6)
         print(f"\n--- {tag} ---")
-        print(f"  Half-UNet     : AV_Dice={r_hu['av_dice']:.4f} | Cross_F1={r_hu['crossing_f1']:.4f} | Thin1px={r_hu['thin_recall']:.4f} | Active=100.0% | {r_hu['ms_per_img']:.1f} ms")
-        print(f"  HaizkLow (K=2): AV_Dice={r_hl2['av_dice']:.4f} | Cross_F1={r_hl2['crossing_f1']:.4f} | Thin1px={r_hl2['thin_recall']:.4f} | Active={r_hl2['active_pct']:.1f}% | {r_hl2['ms_per_img']:.1f} ms")
-        print(f"  HaizkLow (K=4): AV_Dice={r_hl4['av_dice']:.4f} | Cross_F1={r_hl4['crossing_f1']:.4f} | Thin1px={r_hl4['thin_recall']:.4f} | Active={r_hl4['active_pct']:.1f}% | {r_hl4['ms_per_img']:.1f} ms")
+        print(f"  Half-UNet     : AV_Dice={r_hu['av_dice']:.4f} | AV_Sep={r_hu['av_sep']:.4f} | Cross_F1={r_hu['crossing_f1']:.4f} | Thin1px={r_hu['thin_recall']:.4f} | Active=100.0% | {r_hu['ms_per_img']:.1f} ms")
+        print(f"  HaizkLow (K=3): AV_Dice={r_hl3['av_dice']:.4f} | AV_Sep={r_hl3['av_sep']:.4f} | Cross_F1={r_hl3['crossing_f1']:.4f} | Thin1px={r_hl3['thin_recall']:.4f} | Active={r_hl3['active_pct']:.1f}% | {r_hl3['ms_per_img']:.1f} ms")
+        print(f"  HaizkLow (K=6): AV_Dice={r_hl6['av_dice']:.4f} | AV_Sep={r_hl6['av_sep']:.4f} | Cross_F1={r_hl6['crossing_f1']:.4f} | Thin1px={r_hl6['thin_recall']:.4f} | Active={r_hl6['active_pct']:.1f}% | {r_hl6['ms_per_img']:.1f} ms")
 
 
 if __name__ == "__main__":

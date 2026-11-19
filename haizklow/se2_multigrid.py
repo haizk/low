@@ -109,6 +109,8 @@ class SE2AnisotropicSmoother(nn.Module):
         nn.init.zeros_(self.react[-1].weight)
         nn.init.zeros_(self.react[-1].bias)
         self.dt_logit = nn.Parameter(torch.tensor(0.0))
+        self.alpha_logit = nn.Parameter(torch.tensor(0.0))  # spatial transport rate in (0, 0.45)
+        self.beta_logit = nn.Parameter(torch.tensor(-1.0))  # angular turn rate in (0, 0.25)
 
     def _compute_gates(self, u: torch.Tensor, forcing: torch.Tensor):
         N, K, D, Hp, Wp = u.shape
@@ -152,17 +154,21 @@ class SE2AnisotropicSmoother(nn.Module):
         a_next = torch.roll(a, shifts=-1, dims=1)
         ang_flux = (a * a_prev) * (u_prev - u) + (a * a_next) * (u_next - u)
 
-        # 4. Resolution-agnostic scale channels in NCHW
+        # 4. Direct physical SE(2) transport (active from Step 0, Maximum-Principle stable!)
+        alpha = (0.45 * torch.sigmoid(self.alpha_logit)).to(u.dtype)
+        beta = (0.25 * torch.sigmoid(self.beta_logit)).to(u.dtype)
+        u_trans = u + alpha * diff_flux + beta * ang_flux
+
+        # 5. Resolution-agnostic scale channels + nonlinear local reaction
         scale_feat = torch.empty(N, K, 2, Hp, Wp, device=u.device, dtype=u.dtype)
         scale_feat[:, :, 0] = rel_depth
         scale_feat[:, :, 1] = is_finest
 
-        # 5. Zero-copy NCHW reaction update
-        x = torch.cat([u, diff_flux, grad_flux, ang_flux, forcing, scale_feat], dim=2)
+        x = torch.cat([u_trans, diff_flux, grad_flux, ang_flux, forcing, scale_feat], dim=2)
         x = x.reshape(N * K, x.shape[2], Hp, Wp)
         du = self.react(self.norm(x)).view(N, K, D, Hp, Wp)
         dt = (0.5 * torch.sigmoid(self.dt_logit)).to(u.dtype)
-        return u + dt * du.to(u.dtype)
+        return u_trans + dt * du.to(u.dtype)
 
     def smooth_bricks(self, u: torch.Tensor, lvl: QuadtreeLevel,
                       rel_depth: float, is_finest: float, steps: int = 1) -> torch.Tensor:
@@ -199,7 +205,11 @@ class HaizkLow(nn.Module):
 
         self.restrict_conv = nn.Conv2d(d_fiber, d_fiber, kernel_size=2, stride=2)
         self.prolong_conv = nn.Conv2d(d_fiber, d_fiber, kernel_size=3, padding=1)
-        self.rp_scale = nn.Parameter(torch.tensor(0.25))
+        nn.init.zeros_(self.restrict_conv.weight)
+        nn.init.zeros_(self.restrict_conv.bias)
+        nn.init.zeros_(self.prolong_conv.weight)
+        nn.init.zeros_(self.prolong_conv.bias)
+        self.restrict_blend = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.50 convex blend
 
         # Scale-aware brick split predictor (knows rel_depth so each level learns exact sparsity!)
         self.split_head = nn.Sequential(
@@ -239,10 +249,19 @@ class HaizkLow(nn.Module):
         depth_col = torch.full((u.shape[0], 1), rel_depth, device=u.device, dtype=u.dtype)
         return self.split_head(torch.cat([u_mean, u_max, f_max, depth_col], dim=-1)).squeeze(-1)
 
+    def _restrict_op(self, x: torch.Tensor) -> torch.Tensor:
+        # Identity-preserving multigrid restriction (gain = 1.0, ZERO 0.25^8 underflow!)
+        return F.avg_pool2d(x, 2, 2) + self.restrict_conv(x)
+
+    def _prolong_op(self, x: torch.Tensor) -> torch.Tensor:
+        # Identity-preserving multigrid prolongation (gain = 1.0!)
+        up = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        return up + self.prolong_conv(up)
+
     def _prolongate_to_children(self, parent_u: torch.Tensor, p_sel: torch.Tensor) -> torch.Tensor:
         M, K, D, T, _ = parent_u[p_sel].shape
         p = parent_u[p_sel].reshape(M * K, D, T, T)
-        up = self.prolong_conv(F.interpolate(p, scale_factor=2, mode="bilinear", align_corners=False))
+        up = self._prolong_op(p)
         return up.view(M, K, D, 2, T, 2, T).permute(0, 3, 5, 1, 2, 4, 6).reshape(M * 4, K, D, T, T)
 
     def _restrict_to_parent(self, child_u: torch.Tensor, parent_u: torch.Tensor,
@@ -250,9 +269,10 @@ class HaizkLow(nn.Module):
         M = p_sel.numel()
         _, K, D, T, _ = child_u.shape
         x8 = child_u.view(M, 2, 2, K, D, T, T).permute(0, 3, 4, 1, 5, 2, 6).reshape(M * K, D, 2 * T, 2 * T)
-        r = self.restrict_conv(x8).view(M, K, D, T, T)
+        r = self._restrict_op(x8).view(M, K, D, T, T).to(parent_u.dtype)
+        gam = torch.sigmoid(self.restrict_blend).to(parent_u.dtype)
         new_parent = parent_u.clone()
-        new_parent[p_sel] = parent_u[p_sel] + (self.rp_scale * r).to(parent_u.dtype)
+        new_parent[p_sel] = (1.0 - gam) * parent_u[p_sel] + gam * r
         return new_parent
 
     def _l0_bricks_to_dense(self, u0: torch.Tensor, B: int) -> torch.Tensor:
@@ -272,21 +292,23 @@ class HaizkLow(nn.Module):
         f16, f8 = sub_coarse
 
         u32 = self._l0_bricks_to_dense(u0_bricks, B)
-        u32 = self.smoother.smooth_dense(u32, f32, rel_depth=0.0, is_finest=0.0, steps=self.smooth_steps)
+        u32 = self.smoother.smooth_dense(u32, f32, rel_depth=0.0, is_finest=0.0, steps=2)
 
-        u16 = self.restrict_conv(u32.reshape(B * K, D, 32, 32)).view(B, K, D, 16, 16)
-        u16 = self.smoother.smooth_dense(u16, f16, rel_depth=-0.25, is_finest=0.0, steps=1)
+        # True FAS down: 32 -> 16 -> 8
+        u16_0 = self._restrict_op(u32.reshape(B * K, D, 32, 32)).view(B, K, D, 16, 16)
+        u16 = self.smoother.smooth_dense(u16_0, f16, rel_depth=-0.25, is_finest=0.0, steps=2)
 
-        u8 = self.restrict_conv(u16.reshape(B * K, D, 16, 16)).view(B, K, D, 8, 8)
-        u8 = self.smoother.smooth_dense(u8, f8, rel_depth=-0.5, is_finest=0.0, steps=3)
+        u8_0 = self._restrict_op(u16.reshape(B * K, D, 16, 16)).view(B, K, D, 8, 8)
+        u8 = self.smoother.smooth_dense(u8_0, f8, rel_depth=-0.5, is_finest=0.0, steps=4)
 
-        up16 = self.prolong_conv(F.interpolate(u8.reshape(B * K, D, 8, 8), scale_factor=2, mode="bilinear", align_corners=False))
-        u16 = u16 + (self.rp_scale * up16.view(B, K, D, 16, 16)).to(u16.dtype)
-        u16 = self.smoother.smooth_dense(u16, f16, rel_depth=-0.25, is_finest=0.0, steps=1)
+        # True FAS up: prolongate ONLY coarse delta (u_after - u_before)!
+        d16 = self._prolong_op((u8 - u8_0).reshape(B * K, D, 8, 8)).view(B, K, D, 16, 16)
+        u16 = u16 + d16.to(u16.dtype)
+        u16 = self.smoother.smooth_dense(u16, f16, rel_depth=-0.25, is_finest=0.0, steps=2)
 
-        up32 = self.prolong_conv(F.interpolate(u16.reshape(B * K, D, 16, 16), scale_factor=2, mode="bilinear", align_corners=False))
-        u32 = u32 + (self.rp_scale * up32.view(B, K, D, 32, 32)).to(u32.dtype)
-        u32 = self.smoother.smooth_dense(u32, f32, rel_depth=0.0, is_finest=0.0, steps=self.smooth_steps)
+        d32 = self._prolong_op((u16 - u16_0).reshape(B * K, D, 16, 16)).view(B, K, D, 32, 32)
+        u32 = u32 + d32.to(u32.dtype)
+        u32 = self.smoother.smooth_dense(u32, f32, rel_depth=0.0, is_finest=0.0, steps=2)
 
         return self._dense_to_l0_bricks(u32)
 
@@ -294,21 +316,29 @@ class HaizkLow(nn.Module):
                     pyr: List[torch.Tensor], sub_coarse: List[torch.Tensor]) -> List[torch.Tensor]:
         n_lvls = len(levels)
         states = list(states)
+        saved_parents = [None] * n_lvls
 
+        # 1. Downward leg (Finest -> L1): smooth + convex restrict + save pre-solve parent
         for l in range(n_lvls - 1, 0, -1):
             rel_d = l / max(n_lvls - 1, 1)
             is_f = 1.0 if l == n_lvls - 1 else 0.0
-            states[l] = self.smoother.smooth_bricks(states[l], levels[l], rel_d, is_f, steps=self.smooth_steps)
+            s_steps = self.smooth_steps if is_f > 0.5 else max(2, self.smooth_steps)
+            states[l] = self.smoother.smooth_bricks(states[l], levels[l], rel_d, is_f, steps=s_steps)
             states[l - 1] = self._restrict_to_parent(states[l], states[l - 1], levels[l].parent_sel)
+            saved_parents[l - 1] = states[l - 1]
 
+        # 2. Global Coarse Solve at L0 (32 -> 16 -> 8 -> 16 -> 32)
         states[0] = self._coarse_global_solve(states[0], pyr[0], sub_coarse)
 
+        # 3. Upward leg (L1 -> Finest): prolongate ONLY coarse delta (after - before)!
         for l in range(1, n_lvls):
             rel_d = l / max(n_lvls - 1, 1)
             is_f = 1.0 if l == n_lvls - 1 else 0.0
-            delta = self._prolongate_to_children(states[l - 1], levels[l].parent_sel)
-            states[l] = states[l] + (self.rp_scale * delta).to(states[l].dtype)
-            states[l] = self.smoother.smooth_bricks(states[l], levels[l], rel_d, is_f, steps=self.smooth_steps)
+            s_steps = self.smooth_steps if is_f > 0.5 else max(2, self.smooth_steps)
+            coarse_delta = states[l - 1] - saved_parents[l - 1]
+            delta_fine = self._prolongate_to_children(coarse_delta, levels[l].parent_sel)
+            states[l] = states[l] + delta_fine.to(states[l].dtype)
+            states[l] = self.smoother.smooth_bricks(states[l], levels[l], rel_d, is_f, steps=s_steps)
 
         return states
 
@@ -424,7 +454,7 @@ class HaizkLow(nn.Module):
             nb_next = precompute_neighbor_table(c_b, c_by, c_bx, bmap_next, G_next)
 
             f_next = self._gather_forcing_bricks(pyr[l + 1], c_b, c_by, c_bx)
-            u_next = self._init_state(f_next) + (self.rp_scale * self._prolongate_to_children(cur.state, p_sel)).to(f_next.dtype)
+            u_next = 0.5 * self._init_state(f_next) + 0.5 * self._prolongate_to_children(cur.state, p_sel).to(f_next.dtype)
 
             lvl_next = QuadtreeLevel(G_next, c_b, c_by, c_bx, c_morton, bmap_next, nb_next, p_sel, f_next, u_next)
             rel_d = (l + 1) / max(n_lvls - 1, 1)
