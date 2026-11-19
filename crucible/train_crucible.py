@@ -154,7 +154,7 @@ def main():
 
     haizk = train_one(
         "HaizkLow (D=16, K=2)",
-        HaizkLow(d_fiber=16, hidden=48, n_vcycles=2, smooth_steps=1, use_checkpoint=False),
+        HaizkLow(d_fiber=16, hidden=48, n_vcycles=2, smooth_steps=1, use_checkpoint=True),
         train_loader, val256_loader, device, epochs=25, lr=3e-3, is_haizklow=True
     )
 

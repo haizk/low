@@ -161,8 +161,8 @@ class SE2AnisotropicSmoother(nn.Module):
         x = torch.cat([u, diff_flux, grad_flux, ang_flux, forcing, scale_feat], dim=2)
         x = x.reshape(N * K, x.shape[2], Hp, Wp)
         du = self.react(self.norm(x)).view(N, K, D, Hp, Wp)
-        dt = 0.5 * torch.sigmoid(self.dt_logit)
-        return u + dt * du
+        dt = (0.5 * torch.sigmoid(self.dt_logit)).to(u.dtype)
+        return u + dt * du.to(u.dtype)
 
     def smooth_bricks(self, u: torch.Tensor, lvl: QuadtreeLevel,
                       rel_depth: float, is_finest: float, steps: int = 1) -> torch.Tensor:
@@ -374,10 +374,12 @@ class HaizkLow(nn.Module):
         split_logits_list = []
         split_targets_list = []
 
+        # Scheduled Sampling: use exact sparse GT splits (~25% active) early while
+        # split_head warms up, then anneal smoothly to 100% pure Pred splits!
         if self.training and gt_split_masks is not None and union_prob > 0.0:
-            use_union = (torch.rand(B, device=device) < union_prob)
+            use_teacher = (torch.rand(B, device=device) < union_prob)
         else:
-            use_union = torch.zeros(B, device=device, dtype=torch.bool)
+            use_teacher = torch.zeros(B, device=device, dtype=torch.bool)
 
         for l in range(n_lvls - 1):
             cur = levels[l]
@@ -389,9 +391,18 @@ class HaizkLow(nn.Module):
             if gt_split_masks is not None:
                 gt_s = gt_split_masks[l][cur.b_idx, cur.by_idx, cur.bx_idx]
                 split_targets_list.append(gt_s)
-                split_mask = torch.where(use_union[cur.b_idx], pred_mask | (gt_s > 0.5), pred_mask)
+                split_mask = torch.where(use_teacher[cur.b_idx], (gt_s > 0.5), pred_mask)
             else:
                 split_mask = pred_mask
+
+            # Hard VRAM safety cap during training (impossible to explode to 100% dense)
+            if self.training and l >= 1:
+                max_m = max(B, int(0.55 * cur.b_idx.numel()))
+                if int(split_mask.sum().item()) > max_m:
+                    topk_idx = torch.topk(s_logits, k=max_m).indices
+                    cap = torch.zeros_like(split_mask)
+                    cap[topk_idx] = True
+                    split_mask = cap
 
             # Safety guard: ensure at least 1 brick splits globally (avoids 24x per-batch GPU syncs!)
             if not split_mask.any():
