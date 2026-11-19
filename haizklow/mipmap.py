@@ -1,6 +1,6 @@
 # haizklow/mipmap.py
-# HaizkLow v2 — O(1) Flat Multi-Stat + Multiscale Oriented Ridge Pyramid ([B, 17, H_l, W_l])
-# Channels: mean_RGB (3) + max_RGB (3) + min_RGB (3) + pos_ridge_4dir (4) + neg_ridge_4dir (4) = 17.
+# HaizkLow v2.1 — O(1) Multi-Stat + Local-Contrast + Green-Channel Multiscale Oriented Ridge Pyramid
+# Channels (20): mean_RGB(3) + max_RGB(3) + min_RGB(3) + local_contrast_RGB(3) + pos_ridge_4dir(4) + neg_ridge_4dir(4)
 
 import torch
 import torch.nn as nn
@@ -28,14 +28,13 @@ class MultiStatSE2Pyramid(nn.Module):
         k135 = torch.flip(k45, dims=[1]).contiguous()
 
         self.register_buffer("ridge_kernels", torch.stack([k0, k45, k90, k135], dim=0).unsqueeze(1))
-        self.register_buffer("luma_w", torch.tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1))
 
     @torch.no_grad()
-    def _multiscale_ridge(self, lum):
-        H, W = lum.shape[-2:]
-        pos_all = torch.zeros(lum.shape[0], 4, H, W, device=lum.device, dtype=lum.dtype)
+    def _multiscale_ridge(self, ch1):
+        H, W = ch1.shape[-2:]
+        pos_all = torch.zeros(ch1.shape[0], 4, H, W, device=ch1.device, dtype=ch1.dtype)
         neg_all = torch.zeros_like(pos_all)
-        cur = lum
+        cur = ch1
         for s in (1, 2, 4):
             if s > 1:
                 cur = F.avg_pool2d(cur, 2, 2)
@@ -55,20 +54,26 @@ class MultiStatSE2Pyramid(nn.Module):
         assert H == W and H % self.root_res == 0 and ratio >= 1 and (ratio & (ratio - 1)) == 0, \
             f"H=W={H} must be root_res({self.root_res}) * 2^k"
 
-        lum = (img * self.luma_w).sum(dim=1, keepdim=True)
-        pos_r, neg_r = self._multiscale_ridge(lum)
+        # Local background-subtracted RGB kills optic-disc glare & highlights central arterial reflex!
+        local_bg = F.avg_pool2d(img, kernel_size=15, stride=1, padding=7)
+        loc_c = img - local_bg
+
+        # Green channel gives 3x stronger retinal vessel contrast (and equals gray on synthetic Crucible!)
+        green = img[:, 1:2]
+        pos_r, neg_r = self._multiscale_ridge(green)
 
         mean_rgb, max_rgb, min_rgb = img, img, img
-        rev_levels = [torch.cat([mean_rgb, max_rgb, min_rgb, pos_r, neg_r], dim=1)]
+        rev_levels = [torch.cat([mean_rgb, max_rgb, min_rgb, loc_c, pos_r, neg_r], dim=1)]
 
         cur_res = H
         while cur_res > self.root_res:
             mean_rgb = F.avg_pool2d(mean_rgb, 2, 2)
             max_rgb = F.max_pool2d(max_rgb, 2, 2)
             min_rgb = -F.max_pool2d(-min_rgb, 2, 2)
+            loc_c = F.avg_pool2d(loc_c, 2, 2)
             pos_r = F.max_pool2d(pos_r, 2, 2)
             neg_r = F.max_pool2d(neg_r, 2, 2)
-            rev_levels.append(torch.cat([mean_rgb, max_rgb, min_rgb, pos_r, neg_r], dim=1))
+            rev_levels.append(torch.cat([mean_rgb, max_rgb, min_rgb, loc_c, pos_r, neg_r], dim=1))
             cur_res //= 2
 
         levels = list(reversed(rev_levels))
@@ -77,8 +82,9 @@ class MultiStatSE2Pyramid(nn.Module):
             mean_rgb = F.avg_pool2d(mean_rgb, 2, 2)
             max_rgb = F.max_pool2d(max_rgb, 2, 2)
             min_rgb = -F.max_pool2d(-min_rgb, 2, 2)
+            loc_c = F.avg_pool2d(loc_c, 2, 2)
             pos_r = F.max_pool2d(pos_r, 2, 2)
             neg_r = F.max_pool2d(neg_r, 2, 2)
-            sub_coarse.append(torch.cat([mean_rgb, max_rgb, min_rgb, pos_r, neg_r], dim=1))
+            sub_coarse.append(torch.cat([mean_rgb, max_rgb, min_rgb, loc_c, pos_r, neg_r], dim=1))
 
         return levels, sub_coarse

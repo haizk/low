@@ -179,8 +179,8 @@ def main():
         torch.cuda.empty_cache()
 
     haizk = train_one(
-        "HaizkLow v2 (C=32, K=3)",
-        HaizkLow(ch=32, groups=4, n_vcycles=3, smooth_steps=1, use_checkpoint=False),
+        "HaizkLow v2.1 (C=32, K=3)",
+        HaizkLow(ch=32, n_vcycles=3, smooth_steps=1, use_checkpoint=False),
         train_loader, val256_loader, device, epochs=25, lr=3e-3, is_haizklow=True
     )
 

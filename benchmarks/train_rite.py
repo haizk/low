@@ -178,6 +178,7 @@ def evaluate_rite(model, loader, device, is_haizklow=False, n_vcycles_eval=None,
     inter_v, denom_v = 0.0, 0.0
     sep_corr, sep_tot = 0.0, 0.0
     cz_inter, cz_denom = 0.0, 0.0
+    br_hit, br_tot = 0.0, 0.0
     cl_scores = []
     act_sum, n_batches, t_ms = 0.0, 0, 0.0
 
@@ -231,7 +232,15 @@ def evaluate_rite(model, loader, device, is_haizklow=False, n_vcycles_eval=None,
         cz_inter += (pred[:, :2][cz2] * tg[:, :2][cz2]).sum().item()
         cz_denom += (pred[:, :2][cz2].sum() + tg[:, :2][cz2].sum()).item()
 
-        # 5. Topological clDice (on final evals so epochs stay fast!)
+        # 5. Capillary Brick Recall (diagnoses whether active bricks cover all vessels!)
+        if is_haizklow and "finest_brick_map" in out:
+            act_px = (out["finest_brick_map"] >= 0).float().unsqueeze(1)
+            act_px = F.interpolate(act_px, size=(PAD_SIZE, PAD_SIZE), mode="nearest")[:, 0, :H0, :W0]
+            v_gt = (tg[:, 2] > 0.5) & fv
+            br_hit += (act_px[v_gt] > 0.5).float().sum().item()
+            br_tot += v_gt.sum().item()
+
+        # 6. Topological clDice (on final evals so epochs stay fast!)
         if compute_topo:
             p_np = p_av.cpu().numpy()
             t_np = t_av.cpu().numpy()
@@ -254,6 +263,7 @@ def evaluate_rite(model, loader, device, is_haizklow=False, n_vcycles_eval=None,
         "vessel_dice": (2.0 * inter_v + eps) / (denom_v + eps),
         "av_sep": sep_corr / (sep_tot + eps),
         "cross_f1": (2.0 * cz_inter + eps) / (cz_denom + eps),
+        "brick_rec": br_hit / (br_tot + 1e-6) if br_tot > 0 else 1.0,
         "cl_dice": float(np.mean(cl_scores)) if cl_scores else 0.0,
         "active_pct": act_sum / n_batches,
         "ms_per_img": t_ms / n_batches,
@@ -297,8 +307,9 @@ def train_rite_model(name, model, train_loader, test_loader, device,
                         for w, lg in zip(weights, out["cycle_logits"])
                     ) / w_sum
 
+                    pw = torch.tensor(4.0, device=device)
                     split_loss = sum(
-                        F.binary_cross_entropy_with_logits(sl.float(), st.float())
+                        F.binary_cross_entropy_with_logits(sl.float(), st.float(), pos_weight=pw)
                         for sl, st in zip(out["split_logits"], out["split_targets"])
                     ) / len(out["split_logits"])
 
@@ -315,7 +326,7 @@ def train_rite_model(name, model, train_loader, test_loader, device,
             loss_sum += loss.item()
 
         sched.step()
-        if ep == 1 or ep % 10 == 0 or ep == epochs:
+        if ep == 1 or ep % 30 == 0 or ep == epochs:
             res = evaluate_rite(model, test_loader, device, is_haizklow=is_haizklow, compute_topo=(ep == epochs))
             best_av = max(best_av, res["av_dice"])
             topo_str = f" | clDice={res['cl_dice']:.4f}" if ep == epochs else ""
@@ -323,8 +334,8 @@ def train_rite_model(name, model, train_loader, test_loader, device,
                 f"Ep {ep:03d}/{epochs} | loss={loss_sum/len(train_loader):.4f} | "
                 f"Vessel={res['vessel_dice']:.4f} | AV_Dice={res['av_dice']:.4f} "
                 f"(A={res['a_dice']:.3f}/V={res['v_dice']:.3f}) | AV_Sep={res['av_sep']:.4f} | "
-                f"Cross_F1={res['cross_f1']:.4f}{topo_str} | Active={res['active_pct']:.1f}% | "
-                f"{res['ms_per_img']:.1f} ms"
+                f"Cross_F1={res['cross_f1']:.4f}{topo_str} | BR={res['brick_rec']:.3f} | "
+                f"Active={res['active_pct']:.1f}% | {res['ms_per_img']:.1f} ms"
             )
     return model
 
@@ -334,8 +345,8 @@ def main():
     root = find_rite_root()
     print(f"[HaizkLow Track A — RITE Clinical Eyes] Device={device} | Root={root}")
 
-    # repeat=1 -> 20 augmented views per epoch (5 batches of 4), 80 epochs = 400 steps!
-    train_ds = RITEAV3Dataset(root, split="train", augment=True, repeat=1)
+    # repeat=2 -> 40 augmented views per epoch (10 batches of 4), 180 epochs = 1,800 steps!
+    train_ds = RITEAV3Dataset(root, split="train", augment=True, repeat=2)
     test_ds = RITEAV3Dataset(root, split="test", augment=False, repeat=1)
 
     train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=2, pin_memory=True)
@@ -344,32 +355,32 @@ def main():
     half_unet = train_rite_model(
         "Half-UNet Official (C=32)",
         HalfUNet(in_ch=3, out_ch=3, base_ch=32),
-        train_loader, test_loader, device, epochs=80, lr=2e-3, is_haizklow=False
+        train_loader, test_loader, device, epochs=180, lr=2e-3, is_haizklow=False
     )
 
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
     haizk = train_rite_model(
-        "HaizkLow v2 (C=32, K=3)",
-        HaizkLow(ch=32, groups=4, out_ch=3, n_vcycles=3, smooth_steps=1,
+        "HaizkLow v2.1 (C=32, K=3)",
+        HaizkLow(ch=32, out_ch=3, n_vcycles=3, smooth_steps=1,
                  tile_size=4, root_bricks=10, use_checkpoint=False),
-        train_loader, test_loader, device, epochs=80, lr=2.5e-3, is_haizklow=True
+        train_loader, test_loader, device, epochs=180, lr=2.5e-3, is_haizklow=True
     )
 
     # Test-Time Compute Scaling Check on Real Unseen Human Eyes (K=3 vs K=6)!
     print("\n================ FINAL RITE CLINICAL TEST SUMMARY (20 Unseen Eyes, Native 584x565) ================")
     for tag, m, is_hl, k_ev in [
-        ("Half-UNet (53.3K)     ", half_unet, False, None),
-        ("HaizkLow v2 (K=3, 30K)", haizk,     True,  3),
-        ("HaizkLow v2 (K=6, 30K)", haizk,     True,  6),
+        ("Half-UNet (53.3K)       ", half_unet, False, None),
+        ("HaizkLow v2.1 (K=3, 36K)", haizk,     True,  3),
+        ("HaizkLow v2.1 (K=6, 36K)", haizk,     True,  6),
     ]:
         r = evaluate_rite(m, test_loader, device, is_haizklow=is_hl, n_vcycles_eval=k_ev, compute_topo=True)
         print(
             f"  {tag} | Vessel={r['vessel_dice']:.4f} | AV_Dice={r['av_dice']:.4f} "
             f"(A={r['a_dice']:.4f}/V={r['v_dice']:.4f}) | AV_Sep={r['av_sep']:.4f} | "
             f"Cross_F1={r['cross_f1']:.4f} | clDice={r['cl_dice']:.4f} | "
-            f"Active={r['active_pct']:.1f}% | {r['ms_per_img']:.1f} ms"
+            f"BR={r['brick_rec']:.3f} | Active={r['active_pct']:.1f}% | {r['ms_per_img']:.1f} ms"
         )
 
 
