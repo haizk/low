@@ -1,5 +1,6 @@
-# haizklow package
+# haizklow/__init__.py
 from .mipmap import MultiStatSE2Pyramid
-from .se2_multigrid import HaizkLow, batch_gt_split_masks
+from .quadtree import QuadtreeLevel, batch_gt_split_masks
+from .se2_multigrid import HaizkLow
 
-__all__ = ["MultiStatSE2Pyramid", "HaizkLow", "batch_gt_split_masks"]
+__all__ = ["MultiStatSE2Pyramid", "QuadtreeLevel", "batch_gt_split_masks", "HaizkLow"]

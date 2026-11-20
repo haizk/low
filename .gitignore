@@ -3,3 +3,4 @@ __pycache__/
 *$py.class
 tmp/
 .pytest_cache/
+repomix-output.*
