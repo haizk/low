@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .mipmap import MultiStatSE2Pyramid
+from .ops import fused_halo_dw3x3, scatter_bricks_cuda
 
 
 def _part1by1(n: int) -> int:
@@ -102,9 +103,9 @@ class ContractiveBrickSmoother(nn.Module):
         in_dim = 3 * ch + 2
         self.norm = nn.GroupNorm(1, in_dim)
         self.pw = nn.Sequential(
-            nn.Conv2d(in_dim, ch * 3, kernel_size=1),
+            nn.Conv2d(in_dim, 48, kernel_size=1),
             nn.GELU(),
-            nn.Conv2d(ch * 3, ch, kernel_size=1),
+            nn.Conv2d(48, ch, kernel_size=1),
         )
         # Tiny Scale-FiLM conditioning (identity at init)
         self.scale_film = nn.Sequential(
@@ -118,10 +119,9 @@ class ContractiveBrickSmoother(nn.Module):
         self.res_scale = nn.Parameter(torch.tensor(0.5))
         self.state_norm = nn.GroupNorm(1, ch)
 
-    def _step_from_padded(self, u: torch.Tensor, u_pad: torch.Tensor, f_emb: torch.Tensor,
-                          rel_depth: float, is_finest: float) -> torch.Tensor:
+    def _step_from_spatial(self, u: torch.Tensor, spatial: torch.Tensor, f_emb: torch.Tensor,
+                           rel_depth: float, is_finest: float) -> torch.Tensor:
         N, C, Hp, Wp = u.shape
-        spatial = self.spatial_conv(u_pad)
 
         scale_feat = torch.empty(N, 2, Hp, Wp, device=u.device, dtype=u.dtype)
         scale_feat[:, 0] = rel_depth
@@ -130,8 +130,8 @@ class ContractiveBrickSmoother(nn.Module):
         x = torch.cat([u, spatial, f_emb, scale_feat], dim=1)
         du = self.pw(self.norm(x)).to(u.dtype)
 
-        # Apply Scale-FiLM modulation
-        s_vec = torch.tensor([rel_depth, is_finest], device=u.device, dtype=u.dtype)
+        # Apply Scale-FiLM modulation (zero CPU->GPU PCIe sync!)
+        s_vec = scale_feat[0, :, 0, 0]
         gamma, beta = self.scale_film(s_vec).to(u.dtype).chunk(2)
         du = du * (1.0 + gamma.view(1, C, 1, 1)) + beta.view(1, C, 1, 1)
 
@@ -140,15 +140,18 @@ class ContractiveBrickSmoother(nn.Module):
     def smooth_bricks(self, u: torch.Tensor, lvl: QuadtreeLevel,
                       rel_depth: float, is_finest: float, steps: int = 1) -> torch.Tensor:
         for _ in range(steps):
-            u_pad = gather_brick_halo_flat(u, lvl.nb_idx)
-            u = self._step_from_padded(u, u_pad, lvl.f_emb, rel_depth, is_finest)
+            if u.is_cuda and u.shape[-1] == 4:
+                spatial = fused_halo_dw3x3(u, self.spatial_conv.weight, self.spatial_conv.bias, lvl.nb_idx)
+            else:
+                spatial = self.spatial_conv(gather_brick_halo_flat(u, lvl.nb_idx))
+            u = self._step_from_spatial(u, spatial, lvl.f_emb, rel_depth, is_finest)
         return u
 
     def smooth_dense(self, u: torch.Tensor, f_emb: torch.Tensor,
                      rel_depth: float, is_finest: float, steps: int = 1) -> torch.Tensor:
         for _ in range(steps):
-            u_pad = F.pad(u, (1, 1, 1, 1))
-            u = self._step_from_padded(u, u_pad, f_emb, rel_depth, is_finest)
+            spatial = self.spatial_conv(F.pad(u, (1, 1, 1, 1)))
+            u = self._step_from_spatial(u, spatial, f_emb, rel_depth, is_finest)
         return u
 
 
@@ -166,12 +169,11 @@ class HaizkLow(nn.Module):
         self.use_checkpoint = use_checkpoint
 
         self.pyramid = MultiStatSE2Pyramid(tile_size=tile_size, root_bricks=root_bricks)
-        # 3x3 local stem senses vessel caliber & central arterial light reflex immediately!
-        self.init_proj = nn.Conv2d(20, ch, kernel_size=3, padding=1)
+        self.init_proj = nn.Conv2d(20, ch, kernel_size=1)
         self.smoother = ContractiveBrickSmoother(ch=ch)
 
-        self.restrict_conv = nn.Conv2d(ch, ch, kernel_size=2, stride=2)
-        self.prolong_conv = nn.Conv2d(ch, ch, kernel_size=3, padding=1)
+        self.restrict_conv = nn.Conv2d(ch, ch, kernel_size=2, stride=2, groups=ch)
+        self.prolong_conv = nn.Conv2d(ch, ch, kernel_size=3, padding=1, groups=ch)
         nn.init.zeros_(self.restrict_conv.weight)
         nn.init.zeros_(self.restrict_conv.bias)
         nn.init.zeros_(self.prolong_conv.weight)
@@ -310,15 +312,18 @@ class HaizkLow(nn.Module):
             N = brick_logits.shape[0]
             G = lvl.grid_size
 
-            grid = torch.zeros(B, G, G, C_out, T, T, device=device, dtype=torch.float32)
-            mask = torch.zeros(B, G, G, 1, T, T, device=device, dtype=torch.float32)
-            ones = torch.ones(N, 1, T, T, device=device, dtype=torch.float32)
+            if brick_logits.is_cuda and T == 4:
+                lvl_logits, lvl_mask = scatter_bricks_cuda(brick_logits, lvl.b_idx, lvl.by_idx, lvl.bx_idx, B, G)
+            else:
+                grid = torch.zeros(B, G, G, C_out, T, T, device=device, dtype=torch.float32)
+                mask = torch.zeros(B, G, G, 1, T, T, device=device, dtype=torch.float32)
+                ones = torch.ones(N, 1, T, T, device=device, dtype=torch.float32)
 
-            grid = grid.index_put((lvl.b_idx, lvl.by_idx, lvl.bx_idx), brick_logits)
-            mask = mask.index_put((lvl.b_idx, lvl.by_idx, lvl.bx_idx), ones)
+                grid = grid.index_put((lvl.b_idx, lvl.by_idx, lvl.bx_idx), brick_logits)
+                mask = mask.index_put((lvl.b_idx, lvl.by_idx, lvl.bx_idx), ones)
 
-            lvl_logits = grid.permute(0, 3, 1, 4, 2, 5).reshape(B, C_out, G * T, G * T)
-            lvl_mask = mask.permute(0, 3, 1, 4, 2, 5).reshape(B, 1, G * T, G * T)
+                lvl_logits = grid.permute(0, 3, 1, 4, 2, 5).reshape(B, C_out, G * T, G * T)
+                lvl_mask = mask.permute(0, 3, 1, 4, 2, 5).reshape(B, 1, G * T, G * T)
 
             if G * T != H:
                 lvl_logits = F.interpolate(lvl_logits, size=(H, W), mode="nearest")
@@ -331,7 +336,7 @@ class HaizkLow(nn.Module):
         return out
 
     def forward(self, img: torch.Tensor, gt_split_masks: Optional[List[torch.Tensor]] = None,
-                union_prob: float = 0.0, split_thresh: float = 0.35,
+                union_prob: float = 0.0, split_thresh: float = 0.45,
                 adaptive_exit_eps: Optional[float] = None):
         B, _, H, W = img.shape
         device = img.device

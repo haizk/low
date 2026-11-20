@@ -307,7 +307,7 @@ def train_rite_model(name, model, train_loader, test_loader, device,
                         for w, lg in zip(weights, out["cycle_logits"])
                     ) / w_sum
 
-                    pw = torch.tensor(4.0, device=device)
+                    pw = torch.tensor(2.0, device=device)
                     split_loss = sum(
                         F.binary_cross_entropy_with_logits(sl.float(), st.float(), pos_weight=pw)
                         for sl, st in zip(out["split_logits"], out["split_targets"])
