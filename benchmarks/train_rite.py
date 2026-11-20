@@ -362,18 +362,18 @@ def main():
         torch.cuda.empty_cache()
 
     haizk = train_rite_model(
-        "HaizkLow v2.1 (C=32, K=3)",
-        HaizkLow(ch=32, out_ch=3, n_vcycles=3, smooth_steps=1,
+        "HaizkLow v3 (K=4, D=16, 16.1K)",
+        HaizkLow(ch=64, out_ch=3, n_vcycles=2, smooth_steps=1,
                  tile_size=4, root_bricks=10, use_checkpoint=False),
         train_loader, test_loader, device, epochs=180, lr=2.5e-3, is_haizklow=True
     )
 
-    # Test-Time Compute Scaling Check on Real Unseen Human Eyes (K=3 vs K=6)!
+    # Test-Time Compute Scaling Check on Real Unseen Human Eyes (K=2 vs K=4)!
     print("\n================ FINAL RITE CLINICAL TEST SUMMARY (20 Unseen Eyes, Native 584x565) ================")
     for tag, m, is_hl, k_ev in [
         ("Half-UNet (53.3K)       ", half_unet, False, None),
-        ("HaizkLow v2.1 (K=3, 36K)", haizk,     True,  3),
-        ("HaizkLow v2.1 (K=6, 36K)", haizk,     True,  6),
+        ("HaizkLow v3 (K=2, 16.1K)", haizk,     True,  2),
+        ("HaizkLow v3 (K=4, 16.1K)", haizk,     True,  4),
     ]:
         r = evaluate_rite(m, test_loader, device, is_haizklow=is_hl, n_vcycles_eval=k_ev, compute_topo=True)
         print(

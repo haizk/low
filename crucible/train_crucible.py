@@ -179,8 +179,8 @@ def main():
         torch.cuda.empty_cache()
 
     haizk = train_one(
-        "HaizkLow v2.1 (C=32, K=3)",
-        HaizkLow(ch=32, n_vcycles=3, smooth_steps=1, use_checkpoint=False),
+        "HaizkLow v3 (K=4, D=16, 16.1K)",
+        HaizkLow(ch=64, n_vcycles=2, smooth_steps=1, use_checkpoint=False),
         train_loader, val256_loader, device, epochs=25, lr=3e-3, is_haizklow=True
     )
 
@@ -188,12 +188,12 @@ def main():
     for tag, loader in [("512x512 Resolution Jump", val512_res_loader),
                         ("512x512 2x Path-Length Torture", val512_len_loader)]:
         r_hu = benchmark_model(half_unet, loader, device, is_haizklow=False)
-        r_hl3 = benchmark_model(haizk, loader, device, is_haizklow=True, n_vcycles_eval=3)
-        r_hl6 = benchmark_model(haizk, loader, device, is_haizklow=True, n_vcycles_eval=6)
+        r_hl2 = benchmark_model(haizk, loader, device, is_haizklow=True, n_vcycles_eval=2)
+        r_hl4 = benchmark_model(haizk, loader, device, is_haizklow=True, n_vcycles_eval=4)
         print(f"\n--- {tag} ---")
         print(f"  Half-UNet     : Vessel={r_hu['vessel_dice']:.4f} | AV_Dice={r_hu['av_dice']:.4f} | AV_Sep={r_hu['av_sep']:.4f} | Cross_F1={r_hu['crossing_f1']:.4f} | Thin_F1={r_hu['thin_f1']:.4f} | Active=100.0% | {r_hu['ms_per_img']:.1f} ms")
-        print(f"  HaizkLow (K=3): Vessel={r_hl3['vessel_dice']:.4f} | AV_Dice={r_hl3['av_dice']:.4f} | AV_Sep={r_hl3['av_sep']:.4f} | Cross_F1={r_hl3['crossing_f1']:.4f} | Thin_F1={r_hl3['thin_f1']:.4f} | Active={r_hl3['active_pct']:.1f}% | {r_hl3['ms_per_img']:.1f} ms")
-        print(f"  HaizkLow (K=6): Vessel={r_hl6['vessel_dice']:.4f} | AV_Dice={r_hl6['av_dice']:.4f} | AV_Sep={r_hl6['av_sep']:.4f} | Cross_F1={r_hl6['crossing_f1']:.4f} | Thin_F1={r_hl6['thin_f1']:.4f} | Active={r_hl6['active_pct']:.1f}% | {r_hl6['ms_per_img']:.1f} ms")
+        print(f"  HaizkLow (K=2): Vessel={r_hl2['vessel_dice']:.4f} | AV_Dice={r_hl2['av_dice']:.4f} | AV_Sep={r_hl2['av_sep']:.4f} | Cross_F1={r_hl2['crossing_f1']:.4f} | Thin_F1={r_hl2['thin_f1']:.4f} | Active={r_hl2['active_pct']:.1f}% | {r_hl2['ms_per_img']:.1f} ms")
+        print(f"  HaizkLow (K=4): Vessel={r_hl4['vessel_dice']:.4f} | AV_Dice={r_hl4['av_dice']:.4f} | AV_Sep={r_hl4['av_sep']:.4f} | Cross_F1={r_hl4['crossing_f1']:.4f} | Thin_F1={r_hl4['thin_f1']:.4f} | Active={r_hl4['active_pct']:.1f}% | {r_hl4['ms_per_img']:.1f} ms")
 
     # Quick C-style bottleneck profiler on one 512x512 batch
     sample_img = next(iter(val512_res_loader))["image"].to(device)

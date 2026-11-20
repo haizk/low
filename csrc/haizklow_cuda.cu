@@ -1,9 +1,14 @@
 // csrc/haizklow_cuda.cu
-// HaizkLow — Clean CUDA C Brick Kernels:
-//   1. build_bmap_and_neighbors: 1-shot int32 brick map + 8-neighbor table (replaces 50 Python ops!)
-//   2. fused_halo_dw3x3_fwd/bwd: 0 shared-memory bank conflicts (row_stride=8, ch_stride=52)
-//                                + grid-stride backward (<=256 blocks -> >100x less atomic contention!)
-//   3. scatter_bricks_fwd/bwd  : Coalesced 4x4 int32-indexed brick scatter.
+// HaizkLow v3 — Hardware-Native NHWC Morton 4x4 Brick SE(2) CUDA C Engine
+//
+// Kernels:
+//   1. build_bmap_and_neighbors  : 1-shot int32 brick_map [B,G,G] + 8-neighbor table [8,N]
+//   2. gather_bricks_nhwc        : Coalesced [B,C,H,W] -> [N,4,4,C]
+//   3. scatter_bricks_nhwc_fwd/bwd: Coalesced [N,4,4,C] <-> [B,C,H,W] + mask
+//   4. prolong_bricks_nhwc_fwd/bwd: Atomic-free exact bilinear 2x [M,4,4,C] <-> [4*M,4,4,C]
+//   5. restrict_bricks_nhwc_fwd/bwd: Atomic-free exact 2x2 avg [4*M,4,4,C] <-> [M,4,4,C]
+//   6. fused_se2_laplacian_fwd/bwd : Zero-bank-conflict SRAM SE(2) Collinear Transport + +-45 deg Turning
+//                                    (Neumann zero-flux, self-adjoint, ZERO atomics on grad_u/grad_a/grad_c!)
 
 #include <torch/extension.h>
 #include <cuda.h>
@@ -16,58 +21,13 @@ struct AccType { using type = float; };
 template <>
 struct AccType<double> { using type = double; };
 
-// Zero-bank-conflict 6x6 tile layout: row_stride=8, ch_stride=52 (max idx = 5*8+5 = 45 < 52)
-// Warp = (tx=0..15, ty=0) + (tx=0..15, ty=1): ty=1 slots cleanly into the 4-bank gaps of ty=0!
 static constexpr int TILE_ROW_STRIDE = 8;
-static constexpr int TILE_CH_STRIDE  = 52;
+static constexpr int TILE_CH_STRIDE  = 52; // max index = 5*8+5 = 45 < 52; exact 0 bank conflicts!
+static constexpr int MAX_FIBER_D     = 64;
 
-template <typename scalar_t, typename acc_t>
-__device__ __forceinline__ void load_6x6_tile(
-    const scalar_t* __restrict__ x,
-    const int32_t* __restrict__ nb_idx,
-    int64_t n, int64_t N, int64_t c, int64_t C,
-    int tx, acc_t* s
-) {
-    // 1. Interior 4x4 (16 coalesced loads)
-    int py = tx >> 2;
-    int px = tx & 3;
-    s[(py + 1) * TILE_ROW_STRIDE + (px + 1)] = static_cast<acc_t>(x[(n * C + c) * 16 + tx]);
-
-    // 2. Four 4-pixel halo edges (0:N, 1:S, 2:W, 3:E)
-    if (tx < 4) {
-        int64_t nb = static_cast<int64_t>(nb_idx[0 * N + n]);
-        s[0 * TILE_ROW_STRIDE + (tx + 1)] = (nb < N) ? static_cast<acc_t>(x[(nb * C + c) * 16 + 12 + tx]) : acc_t(0);
-    } else if (tx < 8) {
-        int k = tx - 4;
-        int64_t nb = static_cast<int64_t>(nb_idx[1 * N + n]);
-        s[5 * TILE_ROW_STRIDE + (k + 1)] = (nb < N) ? static_cast<acc_t>(x[(nb * C + c) * 16 + k]) : acc_t(0);
-    } else if (tx < 12) {
-        int k = tx - 8;
-        int64_t nb = static_cast<int64_t>(nb_idx[2 * N + n]);
-        s[(k + 1) * TILE_ROW_STRIDE + 0] = (nb < N) ? static_cast<acc_t>(x[(nb * C + c) * 16 + k * 4 + 3]) : acc_t(0);
-    } else {
-        int k = tx - 12;
-        int64_t nb = static_cast<int64_t>(nb_idx[3 * N + n]);
-        s[(k + 1) * TILE_ROW_STRIDE + 5] = (nb < N) ? static_cast<acc_t>(x[(nb * C + c) * 16 + k * 4 + 0]) : acc_t(0);
-    }
-
-    // 3. Four 1-pixel halo corners (4:NW, 5:NE, 6:SW, 7:SE)
-    if (tx == 0) {
-        int64_t nb = static_cast<int64_t>(nb_idx[4 * N + n]);
-        s[0 * TILE_ROW_STRIDE + 0] = (nb < N) ? static_cast<acc_t>(x[(nb * C + c) * 16 + 15]) : acc_t(0);
-    } else if (tx == 1) {
-        int64_t nb = static_cast<int64_t>(nb_idx[5 * N + n]);
-        s[0 * TILE_ROW_STRIDE + 5] = (nb < N) ? static_cast<acc_t>(x[(nb * C + c) * 16 + 12]) : acc_t(0);
-    } else if (tx == 2) {
-        int64_t nb = static_cast<int64_t>(nb_idx[6 * N + n]);
-        s[5 * TILE_ROW_STRIDE + 0] = (nb < N) ? static_cast<acc_t>(x[(nb * C + c) * 16 + 3]) : acc_t(0);
-    } else if (tx == 3) {
-        int64_t nb = static_cast<int64_t>(nb_idx[7 * N + n]);
-        s[5 * TILE_ROW_STRIDE + 5] = (nb < N) ? static_cast<acc_t>(x[(nb * C + c) * 16 + 0]) : acc_t(0);
-    }
-}
-
-// ---- 1-Shot Brick Map + 8-Neighbor Builder ----
+// ============================================================
+// 1. 1-Shot int32 Brick Map & 8-Neighbor Builder
+// ============================================================
 
 __global__ void fill_bmap_kernel(
     const int32_t* __restrict__ b_idx,
@@ -110,131 +70,37 @@ __global__ void build_nb_kernel(
     }
 }
 
-// ---- Fused Zero-Bank-Conflict Halo + DW3x3 Forward & Grid-Stride Backward ----
+// ============================================================
+// 2 & 3. Coalesced NHWC Gather & Scatter ([B,C,H,W] <-> [N,4,4,C])
+// ============================================================
 
 template <typename scalar_t>
-__global__ void fused_halo_dw3x3_fwd_kernel(
-    const scalar_t* __restrict__ u,
-    const scalar_t* __restrict__ w,
-    const scalar_t* __restrict__ b,
-    const int32_t* __restrict__ nb_idx,
-    scalar_t* __restrict__ out,
-    int64_t N, int64_t C
+__global__ void gather_bricks_nhwc_kernel(
+    const scalar_t* __restrict__ dense,
+    const int32_t* __restrict__ b_idx,
+    const int32_t* __restrict__ by_idx,
+    const int32_t* __restrict__ bx_idx,
+    scalar_t* __restrict__ bricks,
+    int64_t N, int64_t C, int64_t G
 ) {
-    using acc_t = typename AccType<scalar_t>::type;
-    __shared__ acc_t smem[8][TILE_CH_STRIDE];
+    int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t total = N * 16 * C;
+    if (tid >= total) return;
 
-    int64_t n = blockIdx.x;
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int64_t c = static_cast<int64_t>(blockIdx.y) * 8 + ty;
-    bool valid = (n < N) && (c < C);
+    int64_t c = tid % C;
+    int64_t tmp = tid / C;
+    int p = static_cast<int>(tmp & 15);
+    int64_t n = tmp >> 4;
 
-    if (valid) {
-        load_6x6_tile<scalar_t, acc_t>(u, nb_idx, n, N, c, C, tx, smem[ty]);
-    }
-    __syncthreads();
-
-    if (valid) {
-        int py = tx >> 2;
-        int px = tx & 3;
-        const acc_t* s = smem[ty];
-        const scalar_t* wc = w + c * 9;
-        acc_t acc = static_cast<acc_t>(b[c]);
-        #pragma unroll
-        for (int ky = 0; ky < 3; ++ky) {
-            #pragma unroll
-            for (int kx = 0; kx < 3; ++kx) {
-                acc += s[(py + ky) * TILE_ROW_STRIDE + (px + kx)] * static_cast<acc_t>(wc[ky * 3 + kx]);
-            }
-        }
-        out[(n * C + c) * 16 + tx] = static_cast<scalar_t>(acc);
-    }
+    int64_t b = b_idx[n];
+    int64_t y = static_cast<int64_t>(by_idx[n]) * 4 + (p >> 2);
+    int64_t x = static_cast<int64_t>(bx_idx[n]) * 4 + (p & 3);
+    int64_t H = G * 4;
+    bricks[tid] = dense[(b * C + c) * (H * H) + y * H + x];
 }
 
 template <typename scalar_t>
-__global__ void fused_halo_dw3x3_bwd_kernel(
-    const scalar_t* __restrict__ grad_out,
-    const scalar_t* __restrict__ u,
-    const scalar_t* __restrict__ w,
-    const int32_t* __restrict__ nb_idx,
-    scalar_t* __restrict__ grad_u,
-    typename AccType<scalar_t>::type* __restrict__ grad_w,
-    typename AccType<scalar_t>::type* __restrict__ grad_b,
-    int64_t N, int64_t C
-) {
-    using acc_t = typename AccType<scalar_t>::type;
-    __shared__ acc_t smem_go[8][TILE_CH_STRIDE];
-    __shared__ acc_t smem_u[8][TILE_CH_STRIDE];
-
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int py = tx >> 2;
-    int px = tx & 3;
-    int64_t c = static_cast<int64_t>(blockIdx.y) * 8 + ty;
-    bool c_valid = (c < C);
-
-    acc_t db_acc = acc_t(0);
-    acc_t dw_acc[9];
-    #pragma unroll
-    for (int k = 0; k < 9; ++k) dw_acc[k] = acc_t(0);
-
-    // Grid-stride loop: accumulates dw/db in registers across many bricks -> <=256 atomics total!
-    for (int64_t n = blockIdx.x; n < N; n += gridDim.x) {
-        if (c_valid) {
-            load_6x6_tile<scalar_t, acc_t>(grad_out, nb_idx, n, N, c, C, tx, smem_go[ty]);
-            load_6x6_tile<scalar_t, acc_t>(u, nb_idx, n, N, c, C, tx, smem_u[ty]);
-        }
-        __syncthreads();
-
-        if (c_valid) {
-            const acc_t* sgo = smem_go[ty];
-            const acc_t* su  = smem_u[ty];
-            const scalar_t* wc = w + c * 9;
-
-            acc_t acc_gu = acc_t(0);
-            acc_t go_val = sgo[(py + 1) * TILE_ROW_STRIDE + (px + 1)];
-            db_acc += go_val;
-
-            #pragma unroll
-            for (int ky = 0; ky < 3; ++ky) {
-                #pragma unroll
-                for (int kx = 0; kx < 3; ++kx) {
-                    acc_gu += sgo[(py + ky) * TILE_ROW_STRIDE + (px + kx)] * static_cast<acc_t>(wc[(2 - ky) * 3 + (2 - kx)]);
-                    dw_acc[ky * 3 + kx] += go_val * su[(py + ky) * TILE_ROW_STRIDE + (px + kx)];
-                }
-            }
-            grad_u[(n * C + c) * 16 + tx] = static_cast<scalar_t>(acc_gu);
-        }
-        __syncthreads();
-    }
-
-    // Single sub-warp (16-lane) shuffle reduction + 1 atomic per block!
-    #pragma unroll
-    for (int off = 8; off > 0; off >>= 1) {
-        db_acc += __shfl_down_sync(0xffffffffu, db_acc, off, 16);
-    }
-    if (c_valid && tx == 0) {
-        atomicAdd(&grad_b[c], db_acc);
-    }
-
-    #pragma unroll
-    for (int k = 0; k < 9; ++k) {
-        acc_t dw = dw_acc[k];
-        #pragma unroll
-        for (int off = 8; off > 0; off >>= 1) {
-            dw += __shfl_down_sync(0xffffffffu, dw, off, 16);
-        }
-        if (c_valid && tx == 0) {
-            atomicAdd(&grad_w[c * 9 + k], dw);
-        }
-    }
-}
-
-// ---- Coalesced 4x4 Brick Scatter ----
-
-template <typename scalar_t>
-__global__ void scatter_bricks_fwd_kernel(
+__global__ void scatter_bricks_nhwc_fwd_kernel(
     const scalar_t* __restrict__ bricks,
     const int32_t* __restrict__ b_idx,
     const int32_t* __restrict__ by_idx,
@@ -247,45 +113,440 @@ __global__ void scatter_bricks_fwd_kernel(
     int64_t n = tid >> 4;
     if (n >= N) return;
 
-    int p = tid & 15;
+    int p = static_cast<int>(tid & 15);
     int64_t b = b_idx[n];
     int64_t y = static_cast<int64_t>(by_idx[n]) * 4 + (p >> 2);
     int64_t x = static_cast<int64_t>(bx_idx[n]) * 4 + (p & 3);
     int64_t H = G * 4;
     int64_t hw = H * H;
 
+    const scalar_t* bp = bricks + (n * 16 + p) * C;
     for (int64_t c = 0; c < C; ++c) {
-        dense[(b * C + c) * hw + y * H + x] = bricks[(n * C + c) * 16 + p];
+        dense[(b * C + c) * hw + y * H + x] = bp[c];
     }
     mask[b * hw + y * H + x] = static_cast<scalar_t>(1);
 }
 
+// ============================================================
+// 4 & 5. Atomic-Free Bilinear Prolongation & 2x2 Avg Restriction (NHWC)
+// ============================================================
+
 template <typename scalar_t>
-__global__ void scatter_bricks_bwd_kernel(
-    const scalar_t* __restrict__ grad_dense,
-    const int32_t* __restrict__ b_idx,
-    const int32_t* __restrict__ by_idx,
-    const int32_t* __restrict__ bx_idx,
-    scalar_t* __restrict__ grad_bricks,
-    int64_t N, int64_t C, int64_t G
+__global__ void prolong_bricks_nhwc_fwd_kernel(
+    const scalar_t* __restrict__ parent,
+    scalar_t* __restrict__ children,
+    int64_t M, int64_t C
 ) {
+    using acc_t = typename AccType<scalar_t>::type;
     int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t n = tid >> 4;
-    if (n >= N) return;
+    int64_t total = M * 64 * C;
+    if (tid >= total) return;
 
-    int p = tid & 15;
-    int64_t b = b_idx[n];
-    int64_t y = static_cast<int64_t>(by_idx[n]) * 4 + (p >> 2);
-    int64_t x = static_cast<int64_t>(bx_idx[n]) * 4 + (p & 3);
-    int64_t H = G * 4;
-    int64_t hw = H * H;
+    int64_t c = tid % C;
+    int64_t tmp = tid / C;
+    int p = static_cast<int>(tmp & 15);
+    int64_t mc = tmp >> 4;
+    int64_t m = mc >> 2;
+    int q = static_cast<int>(mc & 3);
 
-    for (int64_t c = 0; c < C; ++c) {
-        grad_bricks[(n * C + c) * 16 + p] = grad_dense[(b * C + c) * hw + y * H + x];
+    int oy = (q >> 1) * 4 + (p >> 2);
+    int ox = (q & 1) * 4 + (p & 3);
+
+    const int i0_t[8] = {0, 0, 0, 1, 1, 2, 2, 3};
+    const int i1_t[8] = {0, 1, 1, 2, 2, 3, 3, 3};
+    const acc_t w1_t[8] = {acc_t(0), acc_t(0.25), acc_t(0.75), acc_t(0.25), acc_t(0.75), acc_t(0.25), acc_t(0.75), acc_t(0)};
+
+    int y0 = i0_t[oy], y1 = i1_t[oy];
+    int x0 = i0_t[ox], x1 = i1_t[ox];
+    acc_t wy1 = w1_t[oy], wy0 = acc_t(1) - wy1;
+    acc_t wx1 = w1_t[ox], wx0 = acc_t(1) - wx1;
+
+    const scalar_t* pm = parent + m * 16 * C + c;
+    acc_t v00 = static_cast<acc_t>(pm[(y0 * 4 + x0) * C]);
+    acc_t v01 = static_cast<acc_t>(pm[(y0 * 4 + x1) * C]);
+    acc_t v10 = static_cast<acc_t>(pm[(y1 * 4 + x0) * C]);
+    acc_t v11 = static_cast<acc_t>(pm[(y1 * 4 + x1) * C]);
+
+    acc_t res = wy0 * (wx0 * v00 + wx1 * v01) + wy1 * (wx0 * v10 + wx1 * v11);
+    children[tid] = static_cast<scalar_t>(res);
+}
+
+template <typename scalar_t>
+__global__ void prolong_bricks_nhwc_bwd_kernel(
+    const scalar_t* __restrict__ grad_children,
+    scalar_t* __restrict__ grad_parent,
+    int64_t M, int64_t C
+) {
+    using acc_t = typename AccType<scalar_t>::type;
+    int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t total = M * 16 * C;
+    if (tid >= total) return;
+
+    int64_t c = tid % C;
+    int64_t tmp = tid / C;
+    int p = static_cast<int>(tmp & 15);
+    int64_t m = tmp >> 4;
+    int py = p >> 2;
+    int px = p & 3;
+
+    const int rev_len[4] = {3, 4, 4, 3};
+    const int rev_o[4][4] = {{0, 1, 2, 0}, {1, 2, 3, 4}, {3, 4, 5, 6}, {5, 6, 7, 0}};
+    const acc_t rev_w[4][4] = {
+        {acc_t(1.0), acc_t(0.75), acc_t(0.25), acc_t(0.0)},
+        {acc_t(0.25), acc_t(0.75), acc_t(0.75), acc_t(0.25)},
+        {acc_t(0.25), acc_t(0.75), acc_t(0.75), acc_t(0.25)},
+        {acc_t(0.25), acc_t(0.75), acc_t(1.0), acc_t(0.0)}
+    };
+
+    const scalar_t* gcm = grad_children + m * 64 * C + c;
+    acc_t acc = acc_t(0);
+    int ly = rev_len[py];
+    int lx = rev_len[px];
+    for (int iy = 0; iy < ly; ++iy) {
+        int oy = rev_o[py][iy];
+        acc_t wy = rev_w[py][iy];
+        int qy = oy >> 2, cy = oy & 3;
+        for (int ix = 0; ix < lx; ++ix) {
+            int ox = rev_o[px][ix];
+            acc_t wx = rev_w[px][ix];
+            int qx = ox >> 2, cx = ox & 3;
+            int q = (qy << 1) | qx;
+            acc += (wy * wx) * static_cast<acc_t>(gcm[(q * 16 + cy * 4 + cx) * C]);
+        }
+    }
+    grad_parent[tid] = static_cast<scalar_t>(acc);
+}
+
+template <typename scalar_t>
+__global__ void restrict_bricks_nhwc_fwd_kernel(
+    const scalar_t* __restrict__ children,
+    scalar_t* __restrict__ parent,
+    int64_t M, int64_t C
+) {
+    using acc_t = typename AccType<scalar_t>::type;
+    int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t total = M * 16 * C;
+    if (tid >= total) return;
+
+    int64_t c = tid % C;
+    int64_t tmp = tid / C;
+    int p = static_cast<int>(tmp & 15);
+    int64_t m = tmp >> 4;
+    int py = p >> 2;
+    int px = p & 3;
+
+    int q = ((py >> 1) << 1) | (px >> 1);
+    int cy0 = (py & 1) * 2;
+    int cx0 = (px & 1) * 2;
+
+    const scalar_t* chq = children + (m * 4 + q) * 16 * C + c;
+    acc_t s = static_cast<acc_t>(chq[(cy0 * 4 + cx0) * C])
+            + static_cast<acc_t>(chq[(cy0 * 4 + cx0 + 1) * C])
+            + static_cast<acc_t>(chq[((cy0 + 1) * 4 + cx0) * C])
+            + static_cast<acc_t>(chq[((cy0 + 1) * 4 + cx0 + 1) * C]);
+    parent[tid] = static_cast<scalar_t>(acc_t(0.25) * s);
+}
+
+template <typename scalar_t>
+__global__ void restrict_bricks_nhwc_bwd_kernel(
+    const scalar_t* __restrict__ grad_parent,
+    scalar_t* __restrict__ grad_children,
+    int64_t M, int64_t C
+) {
+    using acc_t = typename AccType<scalar_t>::type;
+    int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t total = M * 64 * C;
+    if (tid >= total) return;
+
+    int64_t c = tid % C;
+    int64_t tmp = tid / C;
+    int p = static_cast<int>(tmp & 15);
+    int64_t mc = tmp >> 4;
+    int64_t m = mc >> 2;
+    int q = static_cast<int>(mc & 3);
+
+    int py = (q >> 1) * 2 + (p >> 3);
+    int px = (q & 1) * 2 + ((p & 3) >> 1);
+    acc_t gp = static_cast<acc_t>(grad_parent[(m * 16 + py * 4 + px) * C + c]);
+    grad_children[tid] = static_cast<scalar_t>(acc_t(0.25) * gp);
+}
+
+// ============================================================
+// 6. Fused SRAM SE(2) Graph Laplacian PDE (Zero Bank Conflicts, Zero-Atomic u/a/c Backward!)
+// ============================================================
+
+// Load 6x6 halo of scalar NHWC tensor x[N, 16, 4] for fiber tk (zero on missing neighbor -> Neumann zero-flux!)
+template <typename scalar_t, typename acc_t>
+__device__ __forceinline__ void load_6x6_nhwc_k(
+    const scalar_t* __restrict__ x,
+    const int32_t* __restrict__ nb_idx,
+    int64_t n, int64_t N, int tk, int tx, acc_t* s
+) {
+    int py = tx >> 2;
+    int px = tx & 3;
+    s[(py + 1) * TILE_ROW_STRIDE + (px + 1)] = static_cast<acc_t>(x[(n * 16 + tx) * 4 + tk]);
+
+    if (tx < 4) {
+        int64_t nb = static_cast<int64_t>(nb_idx[0 * N + n]);
+        s[0 * TILE_ROW_STRIDE + (tx + 1)] = (nb < N) ? static_cast<acc_t>(x[(nb * 16 + 12 + tx) * 4 + tk]) : acc_t(0);
+    } else if (tx < 8) {
+        int k = tx - 4;
+        int64_t nb = static_cast<int64_t>(nb_idx[1 * N + n]);
+        s[5 * TILE_ROW_STRIDE + (k + 1)] = (nb < N) ? static_cast<acc_t>(x[(nb * 16 + k) * 4 + tk]) : acc_t(0);
+    } else if (tx < 12) {
+        int k = tx - 8;
+        int64_t nb = static_cast<int64_t>(nb_idx[2 * N + n]);
+        s[(k + 1) * TILE_ROW_STRIDE + 0] = (nb < N) ? static_cast<acc_t>(x[(nb * 16 + k * 4 + 3) * 4 + tk]) : acc_t(0);
+    } else {
+        int k = tx - 12;
+        int64_t nb = static_cast<int64_t>(nb_idx[3 * N + n]);
+        s[(k + 1) * TILE_ROW_STRIDE + 5] = (nb < N) ? static_cast<acc_t>(x[(nb * 16 + k * 4 + 0) * 4 + tk]) : acc_t(0);
+    }
+
+    if (tx == 0) {
+        int64_t nb = static_cast<int64_t>(nb_idx[4 * N + n]);
+        s[0 * TILE_ROW_STRIDE + 0] = (nb < N) ? static_cast<acc_t>(x[(nb * 16 + 15) * 4 + tk]) : acc_t(0);
+    } else if (tx == 1) {
+        int64_t nb = static_cast<int64_t>(nb_idx[5 * N + n]);
+        s[0 * TILE_ROW_STRIDE + 5] = (nb < N) ? static_cast<acc_t>(x[(nb * 16 + 12) * 4 + tk]) : acc_t(0);
+    } else if (tx == 2) {
+        int64_t nb = static_cast<int64_t>(nb_idx[6 * N + n]);
+        s[5 * TILE_ROW_STRIDE + 0] = (nb < N) ? static_cast<acc_t>(x[(nb * 16 + 3) * 4 + tk]) : acc_t(0);
+    } else if (tx == 3) {
+        int64_t nb = static_cast<int64_t>(nb_idx[7 * N + n]);
+        s[5 * TILE_ROW_STRIDE + 5] = (nb < N) ? static_cast<acc_t>(x[(nb * 16 + 0) * 4 + tk]) : acc_t(0);
     }
 }
 
-// ---- PyTorch C++ Entrypoints ----
+// Load 6x6 halo of NHWC tensor u[N, 16, 4, D] for fiber tk and channel d
+template <typename scalar_t, typename acc_t>
+__device__ __forceinline__ void load_6x6_nhwc_kd(
+    const scalar_t* __restrict__ u,
+    const int32_t* __restrict__ nb_idx,
+    int64_t n, int64_t N, int tk, int64_t d, int64_t D, int tx, acc_t* s
+) {
+    int py = tx >> 2;
+    int px = tx & 3;
+    int64_t k_off = tk * D + d;
+    int64_t stride_p = 4 * D;
+    s[(py + 1) * TILE_ROW_STRIDE + (px + 1)] = static_cast<acc_t>(u[(n * 16 + tx) * stride_p + k_off]);
+
+    if (tx < 4) {
+        int64_t nb = static_cast<int64_t>(nb_idx[0 * N + n]);
+        s[0 * TILE_ROW_STRIDE + (tx + 1)] = (nb < N) ? static_cast<acc_t>(u[(nb * 16 + 12 + tx) * stride_p + k_off]) : acc_t(0);
+    } else if (tx < 8) {
+        int k = tx - 4;
+        int64_t nb = static_cast<int64_t>(nb_idx[1 * N + n]);
+        s[5 * TILE_ROW_STRIDE + (k + 1)] = (nb < N) ? static_cast<acc_t>(u[(nb * 16 + k) * stride_p + k_off]) : acc_t(0);
+    } else if (tx < 12) {
+        int k = tx - 8;
+        int64_t nb = static_cast<int64_t>(nb_idx[2 * N + n]);
+        s[(k + 1) * TILE_ROW_STRIDE + 0] = (nb < N) ? static_cast<acc_t>(u[(nb * 16 + k * 4 + 3) * stride_p + k_off]) : acc_t(0);
+    } else {
+        int k = tx - 12;
+        int64_t nb = static_cast<int64_t>(nb_idx[3 * N + n]);
+        s[(k + 1) * TILE_ROW_STRIDE + 5] = (nb < N) ? static_cast<acc_t>(u[(nb * 16 + k * 4 + 0) * stride_p + k_off]) : acc_t(0);
+    }
+
+    if (tx == 0) {
+        int64_t nb = static_cast<int64_t>(nb_idx[4 * N + n]);
+        s[0 * TILE_ROW_STRIDE + 0] = (nb < N) ? static_cast<acc_t>(u[(nb * 16 + 15) * stride_p + k_off]) : acc_t(0);
+    } else if (tx == 1) {
+        int64_t nb = static_cast<int64_t>(nb_idx[5 * N + n]);
+        s[0 * TILE_ROW_STRIDE + 5] = (nb < N) ? static_cast<acc_t>(u[(nb * 16 + 12) * stride_p + k_off]) : acc_t(0);
+    } else if (tx == 2) {
+        int64_t nb = static_cast<int64_t>(nb_idx[6 * N + n]);
+        s[5 * TILE_ROW_STRIDE + 0] = (nb < N) ? static_cast<acc_t>(u[(nb * 16 + 3) * stride_p + k_off]) : acc_t(0);
+    } else if (tx == 3) {
+        int64_t nb = static_cast<int64_t>(nb_idx[7 * N + n]);
+        s[5 * TILE_ROW_STRIDE + 5] = (nb < N) ? static_cast<acc_t>(u[(nb * 16 + 0) * stride_p + k_off]) : acc_t(0);
+    }
+}
+
+template <typename scalar_t>
+__global__ void fused_se2_laplacian_fwd_kernel(
+    const scalar_t* __restrict__ u,
+    const scalar_t* __restrict__ a,
+    const scalar_t* __restrict__ c,
+    const scalar_t* __restrict__ dt_s,
+    const scalar_t* __restrict__ dt_c,
+    const int32_t* __restrict__ nb_idx,
+    scalar_t* __restrict__ out,
+    int64_t N, int64_t D
+) {
+    using acc_t = typename AccType<scalar_t>::type;
+    __shared__ acc_t smem_a[4][TILE_CH_STRIDE];
+    __shared__ acc_t smem_u[4][TILE_CH_STRIDE];
+
+    int64_t n = blockIdx.x;
+    if (n >= N) return;
+
+    int tx = threadIdx.x;
+    int tk = threadIdx.y;
+    int py = tx >> 2;
+    int px = tx & 3;
+
+    const int dy_arr[4] = {0, -1, 1, 1};
+    const int dx_arr[4] = {1,  1, 0, 1};
+    int dy = dy_arr[tk], dx = dx_arr[tk];
+    int center  = (py + 1) * TILE_ROW_STRIDE + (px + 1);
+    int idx_pos = (py + 1 + dy) * TILE_ROW_STRIDE + (px + 1 + dx);
+    int idx_neg = (py + 1 - dy) * TILE_ROW_STRIDE + (px + 1 - dx);
+    int kp = (tk + 1) & 3;
+    int km = (tk + 3) & 3;
+
+    // Load a halo ONCE and reuse across all D channels!
+    load_6x6_nhwc_k<scalar_t, acc_t>(a, nb_idx, n, N, tk, tx, smem_a[tk]);
+    __syncthreads();
+
+    acc_t ap = smem_a[tk][center];
+    acc_t g_pos = ap * smem_a[tk][idx_pos];
+    acc_t g_neg = ap * smem_a[tk][idx_neg];
+    acc_t c_fwd = static_cast<acc_t>(c[(n * 16 + tx) * 4 + tk]);
+    acc_t c_bwd = static_cast<acc_t>(c[(n * 16 + tx) * 4 + km]);
+
+    int64_t out_base = ((n * 16 + tx) * 4 + tk) * D;
+    for (int64_t d = 0; d < D; ++d) {
+        load_6x6_nhwc_kd<scalar_t, acc_t>(u, nb_idx, n, N, tk, d, D, tx, smem_u[tk]);
+        __syncthreads();
+
+        acc_t up = smem_u[tk][center];
+        acc_t sp_flux  = g_pos * (smem_u[tk][idx_pos] - up) + g_neg * (smem_u[tk][idx_neg] - up);
+        acc_t ang_flux = c_fwd * (smem_u[kp][center] - up)  + c_bwd * (smem_u[km][center] - up);
+        acc_t val = up + static_cast<acc_t>(dt_s[d]) * sp_flux + static_cast<acc_t>(dt_c[d]) * ang_flux;
+        out[out_base + d] = static_cast<scalar_t>(val);
+        __syncthreads();
+    }
+}
+
+template <typename scalar_t>
+__global__ void fused_se2_laplacian_bwd_kernel(
+    const scalar_t* __restrict__ grad_out,
+    const scalar_t* __restrict__ u,
+    const scalar_t* __restrict__ a,
+    const scalar_t* __restrict__ c,
+    const scalar_t* __restrict__ dt_s,
+    const scalar_t* __restrict__ dt_c,
+    const int32_t* __restrict__ nb_idx,
+    scalar_t* __restrict__ grad_u,
+    scalar_t* __restrict__ grad_a,
+    scalar_t* __restrict__ grad_c,
+    typename AccType<scalar_t>::type* __restrict__ grad_dt_s,
+    typename AccType<scalar_t>::type* __restrict__ grad_dt_c,
+    int64_t N, int64_t D
+) {
+    using acc_t = typename AccType<scalar_t>::type;
+    __shared__ acc_t smem_a[4][TILE_CH_STRIDE];
+    __shared__ acc_t smem_u[4][TILE_CH_STRIDE];
+    __shared__ acc_t smem_go[4][TILE_CH_STRIDE];
+    __shared__ acc_t s_gdts[MAX_FIBER_D];
+    __shared__ acc_t s_gdtc[MAX_FIBER_D];
+    __shared__ acc_t s_warp_s[2];
+    __shared__ acc_t s_warp_c[2];
+
+    int tx = threadIdx.x;
+    int tk = threadIdx.y;
+    int lane_id = tk * 16 + tx;
+    int warp_id = lane_id >> 5;
+    int lane    = lane_id & 31;
+    int py = tx >> 2;
+    int px = tx & 3;
+
+    if (lane_id < D) {
+        s_gdts[lane_id] = acc_t(0);
+        s_gdtc[lane_id] = acc_t(0);
+    }
+    __syncthreads();
+
+    const int dy_arr[4] = {0, -1, 1, 1};
+    const int dx_arr[4] = {1,  1, 0, 1};
+    int dy = dy_arr[tk], dx = dx_arr[tk];
+    int center  = (py + 1) * TILE_ROW_STRIDE + (px + 1);
+    int idx_pos = (py + 1 + dy) * TILE_ROW_STRIDE + (px + 1 + dx);
+    int idx_neg = (py + 1 - dy) * TILE_ROW_STRIDE + (px + 1 - dx);
+    int kp = (tk + 1) & 3;
+    int km = (tk + 3) & 3;
+
+    for (int64_t n = blockIdx.x; n < N; n += gridDim.x) {
+        load_6x6_nhwc_k<scalar_t, acc_t>(a, nb_idx, n, N, tk, tx, smem_a[tk]);
+        __syncthreads();
+
+        acc_t ap    = smem_a[tk][center];
+        acc_t a_pos = smem_a[tk][idx_pos];
+        acc_t a_neg = smem_a[tk][idx_neg];
+        acc_t g_pos = ap * a_pos;
+        acc_t g_neg = ap * a_neg;
+        acc_t c_fwd = static_cast<acc_t>(c[(n * 16 + tx) * 4 + tk]);
+        acc_t c_bwd = static_cast<acc_t>(c[(n * 16 + tx) * 4 + km]);
+
+        acc_t ga_acc = acc_t(0);
+        acc_t gc_acc = acc_t(0);
+        int64_t u_base = ((n * 16 + tx) * 4 + tk) * D;
+
+        for (int64_t d = 0; d < D; ++d) {
+            load_6x6_nhwc_kd<scalar_t, acc_t>(u, nb_idx, n, N, tk, d, D, tx, smem_u[tk]);
+            load_6x6_nhwc_kd<scalar_t, acc_t>(grad_out, nb_idx, n, N, tk, d, D, tx, smem_go[tk]);
+            __syncthreads();
+
+            acc_t dts = static_cast<acc_t>(dt_s[d]);
+            acc_t dtc = static_cast<acc_t>(dt_c[d]);
+
+            acc_t up    = smem_u[tk][center];
+            acc_t u_pos = smem_u[tk][idx_pos];
+            acc_t u_neg = smem_u[tk][idx_neg];
+            acc_t u_kp  = smem_u[kp][center];
+            acc_t u_km  = smem_u[km][center];
+
+            acc_t gop    = smem_go[tk][center];
+            acc_t go_pos = smem_go[tk][idx_pos];
+            acc_t go_neg = smem_go[tk][idx_neg];
+            acc_t go_kp  = smem_go[kp][center];
+            acc_t go_km  = smem_go[km][center];
+
+            // 1. Self-adjoint grad_u (ZERO atomics!)
+            acc_t sp_go  = g_pos * (go_pos - gop) + g_neg * (go_neg - gop);
+            acc_t ang_go = c_fwd * (go_kp - gop)  + c_bwd * (go_km - gop);
+            grad_u[u_base + d] = static_cast<scalar_t>(gop + dts * sp_go + dtc * ang_go);
+
+            // 2. Exact grad_a & grad_c accumulated in registers across D (ZERO atomics!)
+            ga_acc += dts * (a_pos * (gop - go_pos) * (u_pos - up) + a_neg * (gop - go_neg) * (u_neg - up));
+            gc_acc += dtc * (gop - go_kp) * (u_kp - up);
+
+            // 3. Exact grad_dt_s & grad_dt_c reduced within block
+            acc_t v_s = gop * (g_pos * (u_pos - up) + g_neg * (u_neg - up));
+            acc_t v_c = gop * (c_fwd * (u_kp - up)  + c_bwd * (u_km - up));
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                v_s += __shfl_down_sync(0xffffffffu, v_s, off);
+                v_c += __shfl_down_sync(0xffffffffu, v_c, off);
+            }
+            if (lane == 0) {
+                s_warp_s[warp_id] = v_s;
+                s_warp_c[warp_id] = v_c;
+            }
+            __syncthreads();
+            if (lane_id == 0) {
+                s_gdts[d] += s_warp_s[0] + s_warp_s[1];
+                s_gdtc[d] += s_warp_c[0] + s_warp_c[1];
+            }
+        }
+
+        // Direct coalesced writes for grad_a & grad_c (ZERO atomics!)
+        grad_a[(n * 16 + tx) * 4 + tk] = static_cast<scalar_t>(ga_acc);
+        grad_c[(n * 16 + tx) * 4 + tk] = static_cast<scalar_t>(gc_acc);
+        __syncthreads();
+    }
+
+    __syncthreads();
+    if (lane_id < D) {
+        atomicAdd(&grad_dt_s[lane_id], s_gdts[lane_id]);
+        atomicAdd(&grad_dt_c[lane_id], s_gdtc[lane_id]);
+    }
+}
+
+// ============================================================
+// PyTorch C++ Entrypoints
+// ============================================================
 
 std::vector<torch::Tensor> build_bmap_and_neighbors(
     torch::Tensor b_idx, torch::Tensor by_idx, torch::Tensor bx_idx, int64_t B, int64_t G
@@ -311,62 +572,37 @@ std::vector<torch::Tensor> build_bmap_and_neighbors(
     return {bmap, nb_idx};
 }
 
-torch::Tensor fused_halo_dw3x3_fwd(
-    torch::Tensor u, torch::Tensor w, torch::Tensor b, torch::Tensor nb_idx
+torch::Tensor gather_bricks_nhwc(
+    torch::Tensor dense, torch::Tensor b_idx, torch::Tensor by_idx, torch::Tensor bx_idx, int64_t G
 ) {
-    u = u.contiguous(); w = w.contiguous(); b = b.contiguous(); nb_idx = nb_idx.contiguous();
-    int64_t N = u.size(0), C = u.size(1);
-    auto out = torch::empty_like(u);
-    if (N == 0) return out;
+    dense = dense.contiguous();
+    b_idx = b_idx.contiguous(); by_idx = by_idx.contiguous(); bx_idx = bx_idx.contiguous();
+    int64_t N = b_idx.size(0), C = dense.size(1);
+    auto bricks = torch::empty({N, 4, 4, C}, dense.options());
+    if (N == 0) return bricks;
 
-    dim3 block(16, 8);
-    dim3 grid(N, (C + 7) / 8);
+    int64_t total = N * 16 * C;
+    dim3 block(256);
+    dim3 grid((total + 255) / 256);
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(u.scalar_type(), "fused_halo_dw3x3_fwd", ([&] {
-        fused_halo_dw3x3_fwd_kernel<scalar_t><<<grid, block, 0, stream>>>(
-            u.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(),
-            nb_idx.data_ptr<int32_t>(), out.data_ptr<scalar_t>(), N, C
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(dense.scalar_type(), "gather_bricks_nhwc", ([&] {
+        gather_bricks_nhwc_kernel<scalar_t><<<grid, block, 0, stream>>>(
+            dense.data_ptr<scalar_t>(), b_idx.data_ptr<int32_t>(),
+            by_idx.data_ptr<int32_t>(), bx_idx.data_ptr<int32_t>(),
+            bricks.data_ptr<scalar_t>(), N, C, G
         );
     }));
-    return out;
+    return bricks;
 }
 
-std::vector<torch::Tensor> fused_halo_dw3x3_bwd(
-    torch::Tensor grad_out, torch::Tensor u, torch::Tensor w, torch::Tensor nb_idx
-) {
-    grad_out = grad_out.contiguous(); u = u.contiguous();
-    w = w.contiguous(); nb_idx = nb_idx.contiguous();
-    int64_t N = u.size(0), C = u.size(1);
-    auto grad_u = torch::empty_like(u);
-    auto acc_dtype = (u.scalar_type() == torch::kFloat64) ? torch::kFloat64 : torch::kFloat32;
-    auto grad_w = torch::zeros({C, 1, 3, 3}, w.options().dtype(acc_dtype));
-    auto grad_b = torch::zeros({C}, w.options().dtype(acc_dtype));
-    if (N == 0) return {grad_u, grad_w.to(w.scalar_type()), grad_b.to(w.scalar_type())};
-
-    int64_t grid_x = std::min<int64_t>(N, 256);
-    dim3 block(16, 8);
-    dim3 grid(grid_x, (C + 7) / 8);
-    auto stream = at::cuda::getCurrentCUDAStream();
-
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(u.scalar_type(), "fused_halo_dw3x3_bwd", ([&] {
-        using acc_t = typename AccType<scalar_t>::type;
-        fused_halo_dw3x3_bwd_kernel<scalar_t><<<grid, block, 0, stream>>>(
-            grad_out.data_ptr<scalar_t>(), u.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(),
-            nb_idx.data_ptr<int32_t>(), grad_u.data_ptr<scalar_t>(),
-            grad_w.data_ptr<acc_t>(), grad_b.data_ptr<acc_t>(), N, C
-        );
-    }));
-    return {grad_u, grad_w.to(w.scalar_type()), grad_b.to(w.scalar_type())};
-}
-
-std::vector<torch::Tensor> scatter_bricks_fwd(
+std::vector<torch::Tensor> scatter_bricks_nhwc_fwd(
     torch::Tensor bricks, torch::Tensor b_idx, torch::Tensor by_idx, torch::Tensor bx_idx,
     int64_t B, int64_t G
 ) {
     bricks = bricks.contiguous();
     b_idx = b_idx.contiguous(); by_idx = by_idx.contiguous(); bx_idx = bx_idx.contiguous();
-    int64_t N = bricks.size(0), C = bricks.size(1), H = G * 4;
+    int64_t N = bricks.size(0), C = bricks.size(3), H = G * 4;
     auto dense = torch::zeros({B, C, H, H}, bricks.options());
     auto mask = torch::zeros({B, 1, H, H}, bricks.options());
     if (N == 0) return {dense, mask};
@@ -376,8 +612,8 @@ std::vector<torch::Tensor> scatter_bricks_fwd(
     dim3 grid((total + 255) / 256);
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(bricks.scalar_type(), "scatter_bricks_fwd", ([&] {
-        scatter_bricks_fwd_kernel<scalar_t><<<grid, block, 0, stream>>>(
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(bricks.scalar_type(), "scatter_bricks_nhwc_fwd", ([&] {
+        scatter_bricks_nhwc_fwd_kernel<scalar_t><<<grid, block, 0, stream>>>(
             bricks.data_ptr<scalar_t>(), b_idx.data_ptr<int32_t>(),
             by_idx.data_ptr<int32_t>(), bx_idx.data_ptr<int32_t>(),
             dense.data_ptr<scalar_t>(), mask.data_ptr<scalar_t>(), N, C, G
@@ -386,35 +622,161 @@ std::vector<torch::Tensor> scatter_bricks_fwd(
     return {dense, mask};
 }
 
-torch::Tensor scatter_bricks_bwd(
-    torch::Tensor grad_dense, torch::Tensor b_idx, torch::Tensor by_idx, torch::Tensor bx_idx,
-    int64_t G
+torch::Tensor scatter_bricks_nhwc_bwd(
+    torch::Tensor grad_dense, torch::Tensor b_idx, torch::Tensor by_idx, torch::Tensor bx_idx, int64_t G
 ) {
-    grad_dense = grad_dense.contiguous();
-    b_idx = b_idx.contiguous(); by_idx = by_idx.contiguous(); bx_idx = bx_idx.contiguous();
-    int64_t N = b_idx.size(0), C = grad_dense.size(1);
-    auto grad_bricks = torch::empty({N, C, 4, 4}, grad_dense.options());
-    if (N == 0) return grad_bricks;
+    return gather_bricks_nhwc(grad_dense, b_idx, by_idx, bx_idx, G);
+}
 
-    int64_t total = N * 16;
+torch::Tensor prolong_bricks_nhwc_fwd(torch::Tensor parent) {
+    parent = parent.contiguous();
+    int64_t M = parent.size(0), C = parent.size(3);
+    auto children = torch::empty({M * 4, 4, 4, C}, parent.options());
+    if (M == 0) return children;
+
+    int64_t total = M * 64 * C;
     dim3 block(256);
     dim3 grid((total + 255) / 256);
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(grad_dense.scalar_type(), "scatter_bricks_bwd", ([&] {
-        scatter_bricks_bwd_kernel<scalar_t><<<grid, block, 0, stream>>>(
-            grad_dense.data_ptr<scalar_t>(), b_idx.data_ptr<int32_t>(),
-            by_idx.data_ptr<int32_t>(), bx_idx.data_ptr<int32_t>(),
-            grad_bricks.data_ptr<scalar_t>(), N, C, G
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(parent.scalar_type(), "prolong_bricks_nhwc_fwd", ([&] {
+        prolong_bricks_nhwc_fwd_kernel<scalar_t><<<grid, block, 0, stream>>>(
+            parent.data_ptr<scalar_t>(), children.data_ptr<scalar_t>(), M, C
         );
     }));
-    return grad_bricks;
+    return children;
+}
+
+torch::Tensor prolong_bricks_nhwc_bwd(torch::Tensor grad_children) {
+    grad_children = grad_children.contiguous();
+    int64_t M = grad_children.size(0) / 4, C = grad_children.size(3);
+    auto grad_parent = torch::empty({M, 4, 4, C}, grad_children.options());
+    if (M == 0) return grad_parent;
+
+    int64_t total = M * 16 * C;
+    dim3 block(256);
+    dim3 grid((total + 255) / 256);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(grad_children.scalar_type(), "prolong_bricks_nhwc_bwd", ([&] {
+        prolong_bricks_nhwc_bwd_kernel<scalar_t><<<grid, block, 0, stream>>>(
+            grad_children.data_ptr<scalar_t>(), grad_parent.data_ptr<scalar_t>(), M, C
+        );
+    }));
+    return grad_parent;
+}
+
+torch::Tensor restrict_bricks_nhwc_fwd(torch::Tensor children) {
+    children = children.contiguous();
+    int64_t M = children.size(0) / 4, C = children.size(3);
+    auto parent = torch::empty({M, 4, 4, C}, children.options());
+    if (M == 0) return parent;
+
+    int64_t total = M * 16 * C;
+    dim3 block(256);
+    dim3 grid((total + 255) / 256);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(children.scalar_type(), "restrict_bricks_nhwc_fwd", ([&] {
+        restrict_bricks_nhwc_fwd_kernel<scalar_t><<<grid, block, 0, stream>>>(
+            children.data_ptr<scalar_t>(), parent.data_ptr<scalar_t>(), M, C
+        );
+    }));
+    return parent;
+}
+
+torch::Tensor restrict_bricks_nhwc_bwd(torch::Tensor grad_parent) {
+    grad_parent = grad_parent.contiguous();
+    int64_t M = grad_parent.size(0), C = grad_parent.size(3);
+    auto grad_children = torch::empty({M * 4, 4, 4, C}, grad_parent.options());
+    if (M == 0) return grad_children;
+
+    int64_t total = M * 64 * C;
+    dim3 block(256);
+    dim3 grid((total + 255) / 256);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(grad_parent.scalar_type(), "restrict_bricks_nhwc_bwd", ([&] {
+        restrict_bricks_nhwc_bwd_kernel<scalar_t><<<grid, block, 0, stream>>>(
+            grad_parent.data_ptr<scalar_t>(), grad_children.data_ptr<scalar_t>(), M, C
+        );
+    }));
+    return grad_children;
+}
+
+torch::Tensor fused_se2_laplacian_fwd(
+    torch::Tensor u, torch::Tensor a, torch::Tensor c,
+    torch::Tensor dt_s, torch::Tensor dt_c, torch::Tensor nb_idx
+) {
+    u = u.contiguous(); a = a.contiguous(); c = c.contiguous();
+    dt_s = dt_s.contiguous(); dt_c = dt_c.contiguous(); nb_idx = nb_idx.contiguous();
+    int64_t N = u.size(0), D = u.size(4);
+    TORCH_CHECK(D <= MAX_FIBER_D, "fused_se2_laplacian supports fiber_dim D <= 64");
+    auto out = torch::empty_like(u);
+    if (N == 0) return out;
+
+    dim3 block(16, 4);
+    dim3 grid(N, 1);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(u.scalar_type(), "fused_se2_laplacian_fwd", ([&] {
+        fused_se2_laplacian_fwd_kernel<scalar_t><<<grid, block, 0, stream>>>(
+            u.data_ptr<scalar_t>(), a.data_ptr<scalar_t>(), c.data_ptr<scalar_t>(),
+            dt_s.data_ptr<scalar_t>(), dt_c.data_ptr<scalar_t>(),
+            nb_idx.data_ptr<int32_t>(), out.data_ptr<scalar_t>(), N, D
+        );
+    }));
+    return out;
+}
+
+std::vector<torch::Tensor> fused_se2_laplacian_bwd(
+    torch::Tensor grad_out, torch::Tensor u, torch::Tensor a, torch::Tensor c,
+    torch::Tensor dt_s, torch::Tensor dt_c, torch::Tensor nb_idx
+) {
+    grad_out = grad_out.contiguous(); u = u.contiguous();
+    a = a.contiguous(); c = c.contiguous();
+    dt_s = dt_s.contiguous(); dt_c = dt_c.contiguous(); nb_idx = nb_idx.contiguous();
+    int64_t N = u.size(0), D = u.size(4);
+    TORCH_CHECK(D <= MAX_FIBER_D, "fused_se2_laplacian supports fiber_dim D <= 64");
+
+    auto grad_u = torch::empty_like(u);
+    auto grad_a = torch::empty_like(a);
+    auto grad_c = torch::empty_like(c);
+    auto acc_dtype = (u.scalar_type() == torch::kFloat64) ? torch::kFloat64 : torch::kFloat32;
+    auto grad_dts = torch::zeros({D}, dt_s.options().dtype(acc_dtype));
+    auto grad_dtc = torch::zeros({D}, dt_c.options().dtype(acc_dtype));
+    if (N == 0) {
+        return {grad_u, grad_a, grad_c, grad_dts.to(dt_s.scalar_type()), grad_dtc.to(dt_c.scalar_type())};
+    }
+
+    int64_t grid_x = std::min<int64_t>(N, 256);
+    dim3 block(16, 4);
+    dim3 grid(grid_x, 1);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(u.scalar_type(), "fused_se2_laplacian_bwd", ([&] {
+        using acc_t = typename AccType<scalar_t>::type;
+        fused_se2_laplacian_bwd_kernel<scalar_t><<<grid, block, 0, stream>>>(
+            grad_out.data_ptr<scalar_t>(), u.data_ptr<scalar_t>(),
+            a.data_ptr<scalar_t>(), c.data_ptr<scalar_t>(),
+            dt_s.data_ptr<scalar_t>(), dt_c.data_ptr<scalar_t>(),
+            nb_idx.data_ptr<int32_t>(),
+            grad_u.data_ptr<scalar_t>(), grad_a.data_ptr<scalar_t>(), grad_c.data_ptr<scalar_t>(),
+            grad_dts.data_ptr<acc_t>(), grad_dtc.data_ptr<acc_t>(), N, D
+        );
+    }));
+    return {grad_u, grad_a, grad_c, grad_dts.to(dt_s.scalar_type()), grad_dtc.to(dt_c.scalar_type())};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("build_bmap_and_neighbors", &build_bmap_and_neighbors, "1-Shot int32 Brick Map & 8-Neighbor Builder");
-    m.def("fused_halo_dw3x3_fwd", &fused_halo_dw3x3_fwd, "Zero-Bank-Conflict 4x4 Halo + DW3x3 Forward");
-    m.def("fused_halo_dw3x3_bwd", &fused_halo_dw3x3_bwd, "Grid-Stride 4x4 Halo + DW3x3 Backward");
-    m.def("scatter_bricks_fwd", &scatter_bricks_fwd, "Coalesced 4x4 Brick Scatter Forward");
-    m.def("scatter_bricks_bwd", &scatter_bricks_bwd, "Coalesced 4x4 Brick Scatter Backward");
+    m.def("gather_bricks_nhwc", &gather_bricks_nhwc, "Coalesced NHWC 4x4 Brick Gather");
+    m.def("scatter_bricks_nhwc_fwd", &scatter_bricks_nhwc_fwd, "Coalesced NHWC 4x4 Brick Scatter Forward");
+    m.def("scatter_bricks_nhwc_bwd", &scatter_bricks_nhwc_bwd, "Coalesced NHWC 4x4 Brick Scatter Backward");
+    m.def("prolong_bricks_nhwc_fwd", &prolong_bricks_nhwc_fwd, "Bilinear 2x NHWC Prolongation Forward");
+    m.def("prolong_bricks_nhwc_bwd", &prolong_bricks_nhwc_bwd, "Bilinear 2x NHWC Prolongation Backward");
+    m.def("restrict_bricks_nhwc_fwd", &restrict_bricks_nhwc_fwd, "2x2 Avg NHWC Restriction Forward");
+    m.def("restrict_bricks_nhwc_bwd", &restrict_bricks_nhwc_bwd, "2x2 Avg NHWC Restriction Backward");
+    m.def("fused_se2_laplacian_fwd", &fused_se2_laplacian_fwd, "Zero-Bank-Conflict SE(2) Graph Laplacian Forward");
+    m.def("fused_se2_laplacian_bwd", &fused_se2_laplacian_bwd, "Zero-Atomic SE(2) Graph Laplacian Backward");
 }

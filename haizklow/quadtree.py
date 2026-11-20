@@ -1,13 +1,18 @@
 # haizklow/quadtree.py
-# HaizkLow — Pointerless Morton Z-Order 4x4 Brick Quadtree Utilities
-# Owns all Morton ordering, sparse brick gather/scatter, neighbor tables, and GT split masks.
+# HaizkLow v3 — Pointerless Morton Z-Order 4x4 NHWC Brick Quadtree Primitives
 
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from .ops import build_bmap_and_neighbors_cuda, scatter_bricks_cuda
+from .ops import (
+    build_bmap_and_neighbors_cuda,
+    gather_bricks_nhwc_cuda,
+    prolong_bricks_nhwc,
+    restrict_bricks_nhwc,
+    scatter_bricks_nhwc_cuda,
+)
 
 
 def part1by1(n: int) -> int:
@@ -24,7 +29,6 @@ def morton2d_encode(bx: int, by: int) -> int:
 
 
 def make_l0_morton_tables(root_bricks: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Precomputes Morton permutation tables for the dense L0 root grid."""
     G0 = root_bricks
     codes = [morton2d_encode(r % G0, r // G0) for r in range(G0 * G0)]
     morton_perm = torch.tensor(sorted(range(G0 * G0), key=lambda r: codes[r]), dtype=torch.long)
@@ -56,16 +60,16 @@ class QuadtreeLevel:
     brick_map: torch.Tensor             # [B, G, G] int32 (-1 if unrefined)
     nb_idx: torch.Tensor                # [8, N] int32 (N if missing neighbor)
     parent_sel: Optional[torch.Tensor]  # [M] int64 indices into parent level
-    f_raw: torch.Tensor                 # [N, C_pyr, T, T]
-    f_emb: torch.Tensor                 # [N, C, T, T]
-    state: torch.Tensor                 # [N, C, T, T]
+    f_raw: torch.Tensor                 # [N, 4, 4, 20]
+    f_emb: torch.Tensor                 # [N, 4, 4, 4, D]
+    f_gate_bias: torch.Tensor           # [N, 4, 4, 4, 2]
+    state: torch.Tensor                 # [N, 4, 4, 4, D]
 
 
 @torch.no_grad()
 def build_bmap_and_neighbors(
     b_idx: torch.Tensor, by_idx: torch.Tensor, bx_idx: torch.Tensor, B: int, G: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Builds [B, G, G] int32 brick_map and [8, N] int32 neighbor table (1-shot CUDA or CPU fallback)."""
     b_i32 = b_idx.to(torch.int32)
     by_i32 = by_idx.to(torch.int32)
     bx_i32 = bx_idx.to(torch.int32)
@@ -92,7 +96,6 @@ def build_bmap_and_neighbors(
 def expand_morton_children(
     cur: QuadtreeLevel, p_sel: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Zero-sort Morton expansion: expanding sorted parents into q=0..3 preserves Z-order."""
     M = p_sel.numel()
     device = p_sel.device
     c_parent = p_sel.repeat_interleave(4)
@@ -104,50 +107,114 @@ def expand_morton_children(
     return c_b, c_by, c_bx, c_morton
 
 
-def gather_bricks(
+def gather_bricks_nhwc(
     dense: torch.Tensor, b_idx: torch.Tensor, by_idx: torch.Tensor, bx_idx: torch.Tensor, tile_size: int = 4
 ) -> torch.Tensor:
     B, C, H, W = dense.shape
     T = tile_size
     G = H // T
-    return dense.view(B, C, G, T, G, T).permute(0, 2, 4, 1, 3, 5)[b_idx.long(), by_idx.long(), bx_idx.long()]
+    if dense.is_cuda and T == 4:
+        return gather_bricks_nhwc_cuda(dense, b_idx, by_idx, bx_idx, G)
+    return dense.view(B, C, G, T, G, T).permute(0, 2, 4, 3, 5, 1)[b_idx.long(), by_idx.long(), bx_idx.long()].contiguous()
 
 
-def scatter_bricks(
+def scatter_bricks_nhwc(
     bricks: torch.Tensor, b_idx: torch.Tensor, by_idx: torch.Tensor, bx_idx: torch.Tensor,
     B: int, G: int, tile_size: int = 4
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if bricks.is_cuda and tile_size == 4:
-        return scatter_bricks_cuda(bricks, b_idx.to(torch.int32), by_idx.to(torch.int32), bx_idx.to(torch.int32), B, G)
+        return scatter_bricks_nhwc_cuda(bricks, b_idx, by_idx, bx_idx, B, G)
 
-    N, C, T, _ = bricks.shape
+    N, T, _, C = bricks.shape
     device = bricks.device
-    grid = torch.zeros(B, G, G, C, T, T, device=device, dtype=bricks.dtype)
-    mask = torch.zeros(B, G, G, 1, T, T, device=device, dtype=bricks.dtype)
-    ones = torch.ones(N, 1, T, T, device=device, dtype=bricks.dtype)
-
+    grid = torch.zeros(B, G, G, T, T, C, device=device, dtype=bricks.dtype)
+    mask = torch.zeros(B, G, G, T, T, 1, device=device, dtype=bricks.dtype)
+    ones = torch.ones(N, T, T, 1, device=device, dtype=bricks.dtype)
     idx = (b_idx.long(), by_idx.long(), bx_idx.long())
     grid = grid.index_put(idx, bricks)
     mask = mask.index_put(idx, ones)
-
-    lvl_dense = grid.permute(0, 3, 1, 4, 2, 5).reshape(B, C, G * T, G * T)
-    lvl_mask = mask.permute(0, 3, 1, 4, 2, 5).reshape(B, 1, G * T, G * T)
+    lvl_dense = grid.permute(0, 5, 1, 3, 2, 4).reshape(B, C, G * T, G * T)
+    lvl_mask = mask.permute(0, 5, 1, 3, 2, 4).reshape(B, 1, G * T, G * T)
     return lvl_dense, lvl_mask
 
 
-def gather_brick_halo_ref(x: torch.Tensor, nb_idx: torch.Tensor) -> torch.Tensor:
-    """Pure-PyTorch reference 1px halo gather (used on CPU and in CUDA gradcheck)."""
-    N, C, T, _ = x.shape
+def prolong_bricks_ref(parent: torch.Tensor) -> torch.Tensor:
+    orig_tail = parent.shape[3:]
+    M = parent.shape[0]
+    C = parent.numel() // (M * 16)
+    p = parent.reshape(M, 4, 4, C).permute(0, 3, 1, 2)
+    up = F.interpolate(p, scale_factor=2, mode="bilinear", align_corners=False)
+    return up.view(M, C, 2, 4, 2, 4).permute(0, 2, 4, 3, 5, 1).reshape(M * 4, 4, 4, *orig_tail)
+
+
+def restrict_bricks_ref(children: torch.Tensor) -> torch.Tensor:
+    orig_tail = children.shape[3:]
+    M = children.shape[0] // 4
+    C = children.numel() // (M * 4 * 16)
+    ch = children.reshape(M, 2, 2, 4, 4, C).permute(0, 5, 1, 3, 2, 4).reshape(M, C, 8, 8)
+    return F.avg_pool2d(ch, 2, 2).permute(0, 2, 3, 1).reshape(M, 4, 4, *orig_tail)
+
+
+def prolong_bricks(parent: torch.Tensor) -> torch.Tensor:
+    if parent.is_cuda and parent.shape[1] == 4 and parent.shape[2] == 4:
+        tail = parent.shape[3:]
+        M = parent.shape[0]
+        C = parent.numel() // (M * 16)
+        return prolong_bricks_nhwc(parent.reshape(M, 4, 4, C)).reshape(M * 4, 4, 4, *tail)
+    return prolong_bricks_ref(parent)
+
+
+def restrict_bricks(children: torch.Tensor) -> torch.Tensor:
+    if children.is_cuda and children.shape[1] == 4 and children.shape[2] == 4:
+        tail = children.shape[3:]
+        M = children.shape[0] // 4
+        C = children.numel() // (M * 4 * 16)
+        return restrict_bricks_nhwc(children.reshape(M * 4, 4, 4, C)).reshape(M, 4, 4, *tail)
+    return restrict_bricks_ref(children)
+
+
+def _pad_nhwc_halo_ref(x: torch.Tensor, nb_idx: torch.Tensor) -> torch.Tensor:
+    N = x.shape[0]
+    tail = x.shape[3:]
     nb = nb_idx.long()
-    x_z = torch.cat([x, torch.zeros(1, C, T, T, device=x.device, dtype=x.dtype)], dim=0)
-    pad = torch.zeros(N, C, T + 2, T + 2, device=x.device, dtype=x.dtype)
-    pad[:, :, 1:T + 1, 1:T + 1] = x
-    pad[:, :, 0, 1:T + 1] = x_z[nb[0], :, T - 1, :]
-    pad[:, :, T + 1, 1:T + 1] = x_z[nb[1], :, 0, :]
-    pad[:, :, 1:T + 1, 0] = x_z[nb[2], :, :, T - 1]
-    pad[:, :, 1:T + 1, T + 1] = x_z[nb[3], :, :, 0]
-    pad[:, :, 0, 0] = x_z[nb[4], :, T - 1, T - 1]
-    pad[:, :, 0, T + 1] = x_z[nb[5], :, T - 1, 0]
-    pad[:, :, T + 1, 0] = x_z[nb[6], :, 0, T - 1]
-    pad[:, :, T + 1, T + 1] = x_z[nb[7], :, 0, 0]
+    x_z = torch.cat([x, torch.zeros((1, 4, 4, *tail), device=x.device, dtype=x.dtype)], dim=0)
+    pad = torch.zeros((N, 6, 6, *tail), device=x.device, dtype=x.dtype)
+    pad[:, 1:5, 1:5] = x
+    pad[:, 0, 1:5] = x_z[nb[0], 3, :]
+    pad[:, 5, 1:5] = x_z[nb[1], 0, :]
+    pad[:, 1:5, 0] = x_z[nb[2], :, 3]
+    pad[:, 1:5, 5] = x_z[nb[3], :, 0]
+    pad[:, 0, 0] = x_z[nb[4], 3, 3]
+    pad[:, 0, 5] = x_z[nb[5], 3, 0]
+    pad[:, 5, 0] = x_z[nb[6], 0, 3]
+    pad[:, 5, 5] = x_z[nb[7], 0, 0]
     return pad
+
+
+def fused_se2_laplacian_ref(
+    u: torch.Tensor, a: torch.Tensor, c: torch.Tensor,
+    dt_s: torch.Tensor, dt_c: torch.Tensor, nb_idx: torch.Tensor
+) -> torch.Tensor:
+    u_pad = _pad_nhwc_halo_ref(u, nb_idx)
+    a_pad = _pad_nhwc_halo_ref(a, nb_idx)
+    dirs = ((0, 1), (-1, 1), (1, 0), (1, 1))
+    outs = []
+    dts = dt_s.view(1, 1, 1, -1)
+    dtc = dt_c.view(1, 1, 1, -1)
+    for k, (dy, dx) in enumerate(dirs):
+        ap = a_pad[:, 1:5, 1:5, k]
+        a_pos = a_pad[:, 1 + dy:5 + dy, 1 + dx:5 + dx, k]
+        a_neg = a_pad[:, 1 - dy:5 - dy, 1 - dx:5 - dx, k]
+        g_pos = (ap * a_pos).unsqueeze(-1)
+        g_neg = (ap * a_neg).unsqueeze(-1)
+
+        up = u[:, :, :, k, :]
+        u_pos = u_pad[:, 1 + dy:5 + dy, 1 + dx:5 + dx, k, :]
+        u_neg = u_pad[:, 1 - dy:5 - dy, 1 - dx:5 - dx, k, :]
+        sp_flux = g_pos * (u_pos - up) + g_neg * (u_neg - up)
+
+        kp = (k + 1) & 3
+        km = (k + 3) & 3
+        ang_flux = c[:, :, :, k:k + 1] * (u[:, :, :, kp, :] - up) + c[:, :, :, km:km + 1] * (u[:, :, :, km, :] - up)
+        outs.append(up + dts * sp_flux + dtc * ang_flux)
+    return torch.stack(outs, dim=3)
